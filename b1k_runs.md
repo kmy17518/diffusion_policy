@@ -15,7 +15,7 @@ The new run has separate local, Hugging Face and W&B identities; it never resume
 - Uploader log/exit: `/tmp/dev/logs/dp-radio-clipfilm-taskname-upload-20260916.{log,exit}`.
 - Durable uploader journal: `/tmp/dev/hf-staging/dp-radio-clipfilm-taskname-300k-20260916/`.
 
-Launch the trainer first, then the uploader once the sibling `<run-directory>.trainer_commit.txt` file exists. The new scripts reject occupied GPUs and existing exit files; preserve the journal and archive an old exit file before a deliberate restart. Shell exit traps also record startup failures. Expandable CUDA segments are enabled to reduce allocator fragmentation without changing model math.
+Launch the trainer first, then wait for its first `latest.pt` checkpoint before starting the uploader. Launch provenance lives in the sibling `<run-directory>.trainer_commit.txt` file. The new scripts reject occupied GPUs and existing exit files; preserve the journal and archive an old exit file before a deliberate restart. Shell exit traps also record startup failures. Expandable CUDA segments are enabled to reduce allocator fragmentation without changing model math.
 
 ```bash
 source /tmp/dev/env.sh

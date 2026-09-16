@@ -57,6 +57,8 @@ class ModelConfig:
     imagenet_norm: bool = False
     encoder_weights: str | None = None
     freeze_encoder: bool = False
+    language_conditioning: str = 'none'
+    prompt_source: str = 'task_name'
 
     @property
     def lowdim(self):
@@ -71,7 +73,8 @@ class ModelConfig:
                 'n_action_steps': self.n_action_steps,
                 'cameras': () if self.lowdim else self.cameras, 'image_size': self.image_size,
                 'observation_mode': 'lowdim' if self.lowdim else 'image',
-                'obs_steps': self.obs_steps, 'imagenet_norm': self.imagenet_norm}
+                'obs_steps': self.obs_steps, 'imagenet_norm': self.imagenet_norm,
+                'language_conditioning': self.language_conditioning, 'prompt_source': self.prompt_source}
 
     def to_dict(self):
         return asdict(self)
@@ -79,6 +82,18 @@ class ModelConfig:
     def validate(self):
         if self.variant not in POLICY_TARGETS:
             raise ValueError(f'Unknown diffusion variant {self.variant!r}')
+        if self.language_conditioning not in ('none', 'clip_film'):
+            raise ValueError('language_conditioning must be none or clip_film')
+        if self.prompt_source not in ('task_name', 'task_description'):
+            raise ValueError('prompt_source must be task_name or task_description')
+        if self.language_conditioning == 'clip_film':
+            if self.variant not in ('unet_image', 'unet_hybrid_image', 'transformer_hybrid_image'):
+                raise ValueError('clip_film supports only unet_image, unet_hybrid_image and transformer_hybrid_image')
+            if self.variant == 'transformer_hybrid_image' and self.conditioning != 'global':
+                raise ValueError('clip_film transformer_hybrid_image requires global conditioning; '
+                                 'upstream inpainting detaches the vision encoder')
+            if self.freeze_encoder:
+                raise ValueError('clip_film requires a trainable vision encoder (including FiLM)')
         if self.conditioning not in ('global', 'local', 'inpainting'):
             raise ValueError('conditioning must be global, local or inpainting')
         if self.conditioning == 'local' and self.variant != 'unet_lowdim':
@@ -190,12 +205,20 @@ def build_policy(config, task_map, initialize_encoder=True):
                    for camera in config.cameras}},
         'action': {'shape': [23]},
     }
+    if config.language_conditioning == 'clip_film':
+        from diffusion_policy.b1k.language import LANGUAGE_DIM, LANGUAGE_KEY
+        shape_meta['obs'][LANGUAGE_KEY] = {'shape': [LANGUAGE_DIM], 'type': 'low_dim'}
     common['shape_meta'] = shape_meta
     if config.variant == 'unet_image':
         from diffusion_policy.common.pytorch_util import replace_submodules
         from diffusion_policy.model.vision.model_getter import get_resnet
         from diffusion_policy.model.vision.multi_image_obs_encoder import MultiImageObsEncoder
-        backbone = get_resnet('resnet18', weights=config.encoder_weights if initialize_encoder else None)
+        if config.language_conditioning == 'clip_film':
+            from diffusion_policy.model.vision.clip_film import ResNet18FiLM
+            backbone = ResNet18FiLM(group_norm=config.obs_encoder_group_norm,
+                                    weights=config.encoder_weights if initialize_encoder else None)
+        else:
+            backbone = get_resnet('resnet18', weights=config.encoder_weights if initialize_encoder else None)
         if config.obs_encoder_group_norm:
             backbone = replace_submodules(backbone, lambda m: isinstance(m, torch.nn.BatchNorm2d),
                                           lambda m: torch.nn.GroupNorm(m.num_features // 16, m.num_features))
@@ -207,13 +230,19 @@ def build_policy(config, task_map, initialize_encoder=True):
         encoder = MultiImageObsEncoder(
             shape_meta, backbone, share_rgb_model=config.share_rgb_model,
             resize_shape=config.resize_shape, crop_shape=config.crop_shape,
-            random_crop=config.random_crop, imagenet_norm=config.imagenet_norm)
+            random_crop=config.random_crop, imagenet_norm=config.imagenet_norm,
+            language_key='lang_emb' if config.language_conditioning == 'clip_film' else None)
         policy = policy_type(obs_encoder=encoder, obs_as_global_cond=global_cond, **unet, **common)
         if config.freeze_encoder:
             policy.obs_encoder.eval().requires_grad_(False)
         else:
             policy.obs_encoder.train()
         return policy
+    if config.language_conditioning == 'clip_film':
+        from diffusion_policy.model.vision.clip_film import FiLMHybridObsEncoder
+        common['obs_encoder'] = FiLMHybridObsEncoder(
+            shape_meta, crop_shape=config.crop_shape, group_norm=config.obs_encoder_group_norm,
+            eval_fixed_crop=config.eval_fixed_crop)
     hybrid = dict(crop_shape=config.crop_shape, obs_encoder_group_norm=config.obs_encoder_group_norm,
                   eval_fixed_crop=config.eval_fixed_crop)
     if config.variant == 'unet_hybrid_image':
@@ -230,6 +259,14 @@ def load_checkpoint(path, device='cpu'):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     if checkpoint.get('format') != 'diffusion_policy_b1k_v1':
         raise ValueError('Not a self-contained B1K checkpoint')
+    config = ModelConfig(**checkpoint['config'])
+    config.validate()
+    if config.language_conditioning == 'clip_film':
+        from diffusion_policy.b1k.language import validate_language_cache
+        checkpoint['language'] = validate_language_cache(
+            checkpoint.get('language'), checkpoint['task_map'], config.prompt_source)
+    elif checkpoint.get('language') is not None:
+        raise ValueError('Language cache is incompatible with language_conditioning=none')
     return checkpoint
 
 
@@ -237,5 +274,7 @@ def load_policy(path, device='cpu'):
     checkpoint = load_checkpoint(path, 'cpu')
     policy = build_policy(checkpoint['config'], checkpoint['task_map'], initialize_encoder=False)
     policy.load_state_dict(checkpoint['ema_model'])
+    if 'language' in checkpoint:
+        policy.language = checkpoint['language']
     policy.to(device).eval().requires_grad_(False)
     return policy, checkpoint
