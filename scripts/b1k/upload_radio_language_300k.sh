@@ -15,7 +15,7 @@ if [[ -e "$STATUS" ]]; then
 fi
 trap 'rc=$?; printf "%s\n" "$rc" >"$STATUS.tmp"; mv "$STATUS.tmp" "$STATUS"' EXIT
 exec >>"$LOG" 2>&1
-read -r trainer_commit <"$RUN/trainer_commit.txt"
+read -r trainer_commit <"$RUN.trainer_commit.txt"
 taskset -c 122-123 .venv/bin/python -u scripts/b1k/upload_checkpoints.py \
     --run-dir "$RUN" \
     --staging-dir /tmp/dev/hf-staging/dp-radio-clipfilm-taskname-300k-20260916 \

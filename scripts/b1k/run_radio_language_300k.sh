@@ -21,9 +21,9 @@ if [[ -n "$(nvidia-smi --id "$CUDA_VISIBLE_DEVICES" --query-compute-apps=pid --f
     printf 'Assigned Diffusion Policy GPU is occupied; refusing to start.\n' >&2
     exit 1
 fi
-mkdir -p "$RUN"
-if [[ ! -e "$RUN/trainer_commit.txt" ]]; then
-    git rev-parse HEAD >"$RUN/trainer_commit.txt"
+mkdir -p "$(dirname "$RUN")"
+if [[ ! -e "$RUN.trainer_commit.txt" ]]; then
+    git rev-parse HEAD >"$RUN.trainer_commit.txt"
 fi
 args=()
 if [[ -e "$RUN/latest.pt" ]]; then
