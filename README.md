@@ -1,5 +1,7 @@
 # Diffusion Policy
 
+**BEHAVIOR-1K:** See [b1k.md](b1k.md) for native LeRobot v3 training, checkpoint resume, and compatible WebSocket serving.
+
 [[Project page]](https://diffusion-policy.cs.columbia.edu/)
 [[Paper]](https://diffusion-policy.cs.columbia.edu/#paper)
 [[Data]](https://diffusion-policy.cs.columbia.edu/data/)

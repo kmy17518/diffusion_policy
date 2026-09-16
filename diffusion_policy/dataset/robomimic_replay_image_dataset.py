@@ -17,7 +17,6 @@ from omegaconf import OmegaConf
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.dataset.base_dataset import BaseImageDataset, LinearNormalizer
 from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
-from diffusion_policy.model.common.rotation_transformer import RotationTransformer
 from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs, Jpeg2k
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.sampler import SequenceSampler, get_val_mask
@@ -46,8 +45,11 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             seed=42,
             val_ratio=0.0
         ):
-        rotation_transformer = RotationTransformer(
-            from_rep='axis_angle', to_rep=rotation_rep)
+        rotation_transformer = None
+        if abs_action:
+            from diffusion_policy.model.common.rotation_transformer import RotationTransformer
+            rotation_transformer = RotationTransformer(
+                from_rep='axis_angle', to_rep=rotation_rep)
 
         replay_buffer = None
         if use_cache:

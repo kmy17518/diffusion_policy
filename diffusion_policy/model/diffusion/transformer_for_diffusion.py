@@ -332,8 +332,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             x = self.decoder(
                 tgt=x,
                 memory=memory,
-                tgt_mask=self.mask,
-                memory_mask=self.memory_mask
+                tgt_mask=self.mask[:t, :t] if self.mask is not None else None,
+                memory_mask=self.memory_mask[:t, :tc] if self.memory_mask is not None else None
             )
             # (B,T,n_emb)
         

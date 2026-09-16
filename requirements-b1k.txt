@@ -1,0 +1,25 @@
+# Install torch and torchvision from the hardware-appropriate PyTorch index first.
+numpy==1.26.4
+diffusers==0.35.1
+pyarrow==23.0.1
+av==16.1.0
+zarr==2.18.7
+numcodecs==0.15.1
+einops>=0.6,<1
+scipy>=1.10
+opencv-python-headless==4.11.0.86
+websockets==15.0.1
+msgpack>=1.0,<2
+# The two hybrid variants use upstream robomimic vision encoders.
+robomimic==0.2.0
+# Upstream Zarr/HDF5 equivalence tests.
+numba
+h5py
+imagecodecs
+omegaconf
+hydra-core
+dill
+tqdm
+filelock
+threadpoolctl
+pytest
