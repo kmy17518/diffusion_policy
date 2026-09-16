@@ -1,5 +1,36 @@
 # Transformer Diffusion Policy radio run — 2026-09-16
 
+## Task-name CLIP/FiLM run
+
+The language-conditioned reproduction uses the same radio subset, **300,000 steps**, physical batch **8,960**, 12-layer/512-width transformer, FP32 optimizer, image/crop sizes, CPU affinity and checkpoint schedule below, with `--language-conditioning clip_film --prompt-source task_name`. The original one-hot task input remains. Frozen CLIP ViT-L/14 projected embeddings condition every camera's ResNet residual blocks through FiLM and are included in the observation features, as in the RoboCasa baseline. Conditioned GroupNorm blocks use activation recomputation to retain the original physical batch; this is not gradient accumulation or mixed precision.
+
+The new run has separate local, Hugging Face and W&B identities; it never resumes or replaces the original run:
+
+- Run directory: `outputs/turning-on-radio-transformer12x512-clipfilm-taskname-bs8960-300k-20260916/`.
+- Private Hugging Face destination: https://huggingface.co/kmy17518/b1k-dp-transformer12x512-turning-on-radio-clipfilm-taskname-20260916
+- W&B project is unchanged; new run: https://wandb.ai/kmy17518/b1k-challenge-2026-diffusion-policy/runs/dpradioclipname16
+- W&B experiment: `turning-on-radio-transformer12x512-clipfilm-taskname-bs8960-300k`.
+- GPU 3 on the current node: `GPU-2aa27438-4ef0-fdca-070a-4138fa04301a` (the historical GPU UUID below belongs to the prior node).
+- Trainer log/exit: `/tmp/dev/logs/dp-radio-clipfilm-taskname-300k-20260916.{log,exit}`.
+- Uploader log/exit: `/tmp/dev/logs/dp-radio-clipfilm-taskname-upload-20260916.{log,exit}`.
+- Durable uploader journal: `/tmp/dev/hf-staging/dp-radio-clipfilm-taskname-300k-20260916/`.
+
+Launch the trainer first, then the uploader once `trainer_commit.txt` exists. The new scripts reject occupied GPUs and existing exit files; preserve the journal and archive an old exit file before a deliberate restart. Shell exit traps also record startup failures. Expandable CUDA segments are enabled to reduce allocator fragmentation without changing model math.
+
+```bash
+source /tmp/dev/env.sh
+tmux -L b1k-act-dp-language new-session -d -s dp-radio-language-train \
+  'bash /tmp/dev/baselines/diffusion_policy/scripts/b1k/run_radio_language_300k.sh'
+tmux -L b1k-act-dp-language new-session -d -s dp-radio-language-upload \
+  'bash /tmp/dev/baselines/diffusion_policy/scripts/b1k/upload_radio_language_300k.sh'
+CUDA_VISIBLE_DEVICES='' /tmp/dev/baselines/act/.venv/bin/python \
+  /tmp/dev/scripts/act-dp-language-status.py
+```
+
+The launch recipe is prepared; live qualification and launch status are recorded below once verified. Local qualification and monitoring artifacts use `/tmp/dev/audits/act-dp-language-20260916/`. Tmux survives client disconnects, not machine/container termination.
+
+## Original unconditioned run
+
 ## Configuration
 
 - Dataset: `/tmp/dev/datasets/2026-challenge-demos`, **turning_on_radio only**, all 200 episodes; exact full-task normalization, no episode limit.
