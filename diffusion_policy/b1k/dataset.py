@@ -295,6 +295,17 @@ class B1KLeRobotDataset(BaseImageDataset):
     def __len__(self):
         return len(self.sampler)
 
+    def __getitems__(self, indices):
+        grouped = defaultdict(list)
+        for offset, index in enumerate(indices):
+            position, frames = self.sampler.locate(index)
+            grouped[position].append((int(frames[0]), offset, index))
+        result = [None] * len(indices)
+        for entries in grouped.values():
+            for _, offset, index in sorted(entries):
+                result[offset] = self[index]
+        return result
+
     def __getitem__(self, index):
         position, frames = self.sampler.locate(index)
         episode = self.episodes[position]

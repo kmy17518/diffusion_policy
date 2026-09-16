@@ -710,3 +710,231 @@ def test_dataset_denial_guard(root):
         with pytest.raises(AssertionError, match='Video unavailable'):
             av.open(str(root / 'videos/unused.mp4'))
     assert json.loads((root / 'meta/info.json').read_text())['fps'] == 10
+
+
+def test_bulk_dataset_fetch_preserves_samples_and_order(root):
+    dataset = make_dataset(root, episode_cache_size=1)
+    indices = [len(dataset) - 1, 2, 0, len(dataset) - 1, 1, 4]
+    expected = [dataset[index] for index in indices]
+    dataset.close()
+    actual = dataset.__getitems__(indices)
+    for item, reference in zip(actual, expected):
+        torch.testing.assert_close(item['action'], reference['action'], rtol=0, atol=0)
+        for key, value in item['obs'].items():
+            torch.testing.assert_close(value, reference['obs'][key], rtol=0, atol=0)
+    dataset.close()
+
+
+def longrun_args(root, output):
+    return ['--dataset-path', str(root), '--output-dir', str(output), '--device', 'cpu',
+            '--num-workers', '0', '--batch-size', '3', '--cpu-threads', '1',
+            '--variant', 'transformer_lowdim', '--n-layer', '1', '--n-head', '2', '--n-emb', '16',
+            '--horizon', '4', '--n-action-steps', '3', '--num-train-timesteps', '4',
+            '--num-inference-steps', '2']
+
+
+@pytest.mark.parametrize('limit,expected', [(0, [1, 2, 4, 5]), (1, [5]), (3, [2, 4, 5])])
+def test_longrun_retention_export_and_resume(root, tmp_path, limit, expected):
+    from diffusion_policy.b1k.model import load_checkpoint
+    output = tmp_path / 'longrun'
+    args = longrun_args(root, output) + ['--save-every', '2', '--export-every', '2',
+                                       '--save-first-step', '--save-total-limit', str(limit)]
+    train_main(args + ['--max-steps', '5'])
+    assert [int(path.stem.split('-')[1]) for path in sorted(output.glob('step-*.pt'))] == expected
+    queue = output / 'export_queue'
+    assert [path.name for path in (queue / 'full').glob('*.pt')] == ['step-00000005.pt']
+    assert (queue / 'full/step-00000005.pt').stat().st_ino == (output / 'latest.pt').stat().st_ino
+    assert sorted(path.name for path in (queue / 'eval').glob('*.pt')) == ['step-00000002.pt', 'step-00000004.pt']
+    full = load_checkpoint(output)
+    assert full['checkpoint_type'] == 'full' and full['optimizer']['state']
+    evaluation = load_checkpoint(queue / 'eval/step-00000004.pt')
+    assert set(evaluation) == {'format', 'checkpoint_type', 'config', 'task_map', 'normalizer', 'ema_model', 'step'}
+    assert evaluation['checkpoint_type'] == 'eval' and evaluation['step'] == 4
+    with pytest.raises(ValueError, match='eval-only'):
+        train_main(args + ['--max-steps', '6', '--resume', str(queue / 'eval/step-00000004.pt')])
+    records = [json.loads(line) for line in (output / 'train.jsonl').read_text().splitlines()]
+    assert [record['step'] for record in records] == list(range(1, 6))
+    for record in records:
+        assert record['step_s'] == record['compute_s'] + record['data_wait_s']
+        assert record['samples_per_s'] > 0 and record['checkpoint_s'] >= 0
+        assert record['gpu_allocated_bytes'] == record['gpu_reserved_bytes'] == record['gpu_peak_allocated_bytes'] == 0
+    train_main(args + ['--max-steps', '6', '--resume', str(output), '--loader-batch-size', '2'])
+    assert load_checkpoint(output)['step'] == 6
+    root.rename(root.with_name('removed-dataset'))
+    policy, evaluation = load_policy(queue / 'eval/step-00000004.pt')
+    wrapper = B1KPolicySession(policy, evaluation['config'], evaluation['task_map'])
+    result = wrapper.act({PROPRIO_KEY: np.ones((2, 61), np.float32), 'task_id': [3, 9]})
+    assert result.shape == (2, 23) and np.isfinite(result).all()
+
+
+def test_full_queue_hardlink_survives_pruning(root, tmp_path, monkeypatch):
+    import os
+    from diffusion_policy.b1k import train
+    output = tmp_path / 'run'
+    staged = tmp_path / 'uploader-held.pt'
+    original = train.publish_full_checkpoint
+
+    def handoff(output, path):
+        if path.name == 'step-00000002.pt':
+            os.link(output / 'export_queue/full/step-00000001.pt', staged)
+        original(output, path)
+
+    monkeypatch.setattr(train, 'publish_full_checkpoint', handoff)
+    train_main(longrun_args(root, output) + ['--max-steps', '2', '--save-every', '1', '--save-total-limit', '1'])
+    assert not (output / 'step-00000001.pt').exists()
+    assert not (output / 'export_queue/full/step-00000001.pt').exists()
+    assert torch.load(staged, weights_only=True)['step'] == 1
+
+
+def test_output_lock_rejects_concurrent_writer(tmp_path):
+    from diffusion_policy.b1k.train import output_lock
+    output = tmp_path / 'run'
+    with output_lock(output):
+        with pytest.raises(RuntimeError, match='Another trainer holds'):
+            train_main(longrun_args(tmp_path / 'missing', output) + ['--max-steps', '1'])
+    with output_lock(output):
+        assert (output / 'run.lock').exists()
+
+
+@pytest.mark.parametrize('chunk', [1, 2, 3, 5, 8])
+def test_chunked_sampler_preserves_optimizer_batches(chunk):
+    from diffusion_policy.b1k.train import training_batches
+    sampler = StepBatchSampler(101, 5, 0, 4, 42, loader_batch_size=chunk)
+    indices = list(sampler)
+    assert len(indices) == len(sampler)
+    batches = [{'obs': {'state': torch.tensor(items)[:, None]}, 'action': torch.tensor(items)[:, None]}
+               for items in indices]
+    restored = list(training_batches(batches, 5))
+    expected = list(StepBatchSampler(101, 5, 0, 4, 42))
+    assert [batch['action'][:, 0].tolist() for batch in restored] == expected
+    assert [batch['obs']['state'][:, 0].tolist() for batch in restored] == expected
+    chunks_per_step = (5 + chunk - 1) // chunk
+    assert indices[2 * chunks_per_step:] == list(StepBatchSampler(101, 5, 2, 4, 42, chunk))
+
+
+def test_chunked_training_and_upstream_resume_exact(root, tmp_path):
+    output, full = tmp_path / 'resumed', tmp_path / 'full'
+    recipe = ['--optimizer', 'upstream', '--weight-decay', '0.001', '--betas', '0.9', '0.95']
+    args = longrun_args(root, output) + recipe
+    train_main(args + ['--max-steps', '2', '--loader-batch-size', '2', '--num-workers', '1'])
+    train_main(longrun_args(root, output) + ['--max-steps', '3', '--resume', str(output)])
+    train_main(longrun_args(root, full) + recipe + ['--max-steps', '3'])
+    resumed, reference = [torch.load(path / 'latest.pt', weights_only=True) for path in (output, full)]
+    for field in ('model', 'ema_model'):
+        for key, value in resumed[field].items():
+            torch.testing.assert_close(value, reference[field][key], rtol=0, atol=0)
+    assert resumed['training']['optimizer'] == 'upstream'
+    assert resumed['training']['betas'] == (0.9, 0.95)
+    assert [group['weight_decay'] for group in resumed['optimizer']['param_groups']] == [0.001, 0.0]
+    for key, values in resumed['optimizer']['state'].items():
+        for name, value in values.items():
+            torch.testing.assert_close(value, reference['optimizer']['state'][key][name], rtol=0, atol=0)
+
+
+def test_upstream_image_optimizer_matches_parameter_groups(root):
+    from diffusion_policy.b1k.train import build_optimizer, parser
+    config = ModelConfig(variant='transformer_hybrid_image', horizon=4, n_action_steps=2,
+                         cameras=('head',), image_size=32, n_layer=1, n_head=2, n_emb=16)
+    policy = build_policy(config, {3: 'alpha'})
+    args = parser().parse_args(['--dataset-path', str(root), '--output-dir', 'unused',
+                               '--variant', config.variant, '--optimizer', 'upstream',
+                               '--weight-decay', '0.001', '--obs-encoder-weight-decay', '0.000002',
+                               '--betas', '0.9', '0.95'])
+    optimizer = build_optimizer(policy, args)
+    reference = policy.get_optimizer(0.001, 0.000002, 1e-4, (0.9, 0.95))
+    for actual, expected in zip(optimizer.param_groups, reference.param_groups):
+        assert actual['weight_decay'] == expected['weight_decay']
+        assert actual['betas'] == expected['betas']
+        assert [id(param) for param in actual['params']] == [id(param) for param in expected['params']]
+    assert [id(param) for param in optimizer.param_groups[-1]['params']] == [id(param) for param in policy.obs_encoder.parameters()]
+
+
+def test_longrun_defaults_and_cpu_thread_limits(monkeypatch):
+    from diffusion_policy.b1k.train import configure_cpu_threads, parser, seed_worker
+    import cv2
+    import os
+    args = parser().parse_args(['--dataset-path', 'unused', '--output-dir', 'unused'])
+    assert args.save_total_limit == 0 and args.export_every == 10000 and not args.save_first_step
+    assert args.wandb_mode == 'disabled' and args.prefetch_factor == 1 and args.cpu_threads == 2
+    assert args.loader_batch_size is None and args.optimizer == 'adamw' and args.betas == [0.9, 0.999]
+    configure_cpu_threads(2)
+    assert torch.get_num_threads() == pa.cpu_count() == pa.io_thread_count() == cv2.getNumThreads() == 2
+    seed_worker(0)
+    assert torch.get_num_threads() == pa.cpu_count() == pa.io_thread_count() == cv2.getNumThreads() == 1
+    assert os.environ['OMP_NUM_THREADS'] == '1'
+
+
+def test_wandb_mock_online_metrics_and_resume(root, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import sys
+    runs, calls = [], []
+
+    def initialize(**kwargs):
+        calls.append(kwargs)
+        run = SimpleNamespace(settings=SimpleNamespace(mode='online'), records=[], definitions=[], exits=[])
+        run.log = lambda record, step: run.records.append((copy.deepcopy(record), step))
+        run.define_metric = lambda *args, **kwargs: run.definitions.append((args, kwargs))
+        run.finish = lambda exit_code: run.exits.append(exit_code)
+        runs.append(run)
+        return run
+
+    monkeypatch.setenv('WANDB_API_KEY', 'test-key')
+    monkeypatch.setitem(sys.modules, 'wandb', SimpleNamespace(init=initialize, Settings=lambda **kwargs: kwargs))
+    output = tmp_path / 'logged'
+    args = longrun_args(root, output) + ['--wandb-mode', 'online']
+    train_main(args + ['--max-steps', '1', '--wandb-project', 'project', '--wandb-entity', 'entity', '--wandb-name', 'name'])
+    first = torch.load(output / 'latest.pt', weights_only=True)
+    train_main(args + ['--max-steps', '2', '--resume', str(output)])
+    second = torch.load(output / 'latest.pt', weights_only=True)
+    assert first['wandb'] == second['wandb'] == json.loads((output / 'wandb.json').read_text())
+    assert calls[0]['id'] == calls[1]['id'] == first['wandb']['id']
+    assert calls[1]['project'] == 'project' and calls[1]['entity'] == 'entity' and calls[1]['resume'] == 'allow'
+    assert [run.records[0][1] for run in runs] == [1, 2]
+    assert all(run.exits == [0] and len(run.definitions) == 2 for run in runs)
+    assert {'step', 'loss', 'step_s', 'data_wait_s', 'gpu_allocated_bytes'} <= set(runs[0].records[0][0])
+    with pytest.raises(ValueError, match='conflicts'):
+        train_main(args + ['--max-steps', '3', '--resume', str(output), '--wandb-id', 'different'])
+
+
+@pytest.mark.parametrize('failure', ['missing-key', 'authentication', 'offline-fallback'])
+def test_wandb_online_fails_before_dataset(tmp_path, monkeypatch, failure):
+    from types import SimpleNamespace
+    import sys
+    from diffusion_policy.b1k import train
+    monkeypatch.setenv('WANDB_API_KEY', 'test-key')
+    if failure == 'missing-key':
+        monkeypatch.delenv('WANDB_API_KEY')
+
+    def initialize(**kwargs):
+        if failure == 'authentication':
+            raise RuntimeError('invalid credentials')
+        return SimpleNamespace(settings=SimpleNamespace(mode='offline'), finish=lambda **kwargs: None)
+
+    monkeypatch.setitem(sys.modules, 'wandb', SimpleNamespace(init=initialize, Settings=lambda **kwargs: kwargs))
+    monkeypatch.setattr(train, 'B1KLeRobotDataset', lambda *args, **kwargs: pytest.fail('Dataset opened before W&B auth'))
+    with pytest.raises(RuntimeError, match='W&B'):
+        train_main(longrun_args(tmp_path / 'missing', tmp_path / 'run') + ['--max-steps', '1', '--wandb-mode', 'online'])
+
+
+@pytest.mark.parametrize('flag', ['--save-total-limit', '--export-every', '--prefetch-factor', '--worker-cpu-threads', '--loader-batch-size'])
+def test_longrun_invalid_flags(tmp_path, flag):
+    with pytest.raises(ValueError):
+        train_main(longrun_args(tmp_path / 'missing', tmp_path / 'run') + [flag, '-1'])
+
+
+def test_atomic_save_failure_keeps_previous_checkpoint(tmp_path, monkeypatch):
+    from diffusion_policy.b1k.train import atomic_save
+    path = tmp_path / 'step-00000001.pt'
+    atomic_save({'step': 1}, path)
+    with pytest.raises(FileExistsError):
+        atomic_save({'step': 9}, path)
+
+    def interrupted(checkpoint, stream):
+        stream.write(b'partial')
+        raise OSError('disk full')
+
+    monkeypatch.setattr(torch, 'save', interrupted)
+    with pytest.raises(OSError, match='disk full'):
+        atomic_save({'step': 2}, tmp_path / 'step-00000002.pt')
+    assert list(tmp_path.iterdir()) == [path]
+    assert torch.load(path, weights_only=True)['step'] == 1

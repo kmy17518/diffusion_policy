@@ -10,6 +10,8 @@ scipy>=1.10
 opencv-python-headless==4.11.0.86
 websockets==15.0.1
 msgpack>=1.0,<2
+wandb==0.30.0
+huggingface_hub==0.36.2
 # The two hybrid variants use upstream robomimic vision encoders.
 robomimic==0.2.0
 # Upstream Zarr/HDF5 equivalence tests.
