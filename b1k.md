@@ -6,11 +6,12 @@ The backward-compatible default is `unet_image`: upstream `DiffusionUnetImagePol
 
 ## Environment
 
-Use a project-local environment. On the verified ARM/GB300 host, Python 3.11 avoids the unavailable Python 3.10 `numcodecs` wheel/header combination:
+Use a project-local environment in the checkout you are working in: the main clone or a git worktree of it (for example `/tmp/dev/baselines/diffusion_policy_lang_goal`). Each checkout gets its own `.venv` (gitignored) and its own `outputs/`; `scripts/b1k/run_radio_300k.sh` likewise runs from whichever checkout contains it. The commands on this page run from that checkout, so set `DP_DIR` to it once per shell. On the verified ARM/GB300 host, Python 3.11 avoids the unavailable Python 3.10 `numcodecs` wheel/header combination:
 
 ```bash
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
+export DP_DIR=/tmp/dev/baselines/diffusion_policy   # this checkout; e.g. /tmp/dev/baselines/diffusion_policy_lang_goal for that worktree
+cd "$DP_DIR"
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python torch==2.10.0 torchvision==0.25.0 \
   --index-url https://download.pytorch.org/whl/cu130
@@ -26,11 +27,11 @@ Choose a hardware-appropriate PyTorch index elsewhere. The two hybrid classes re
 
 ```bash
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/train_b1k.py \
   --dataset-path /tmp/dev/datasets/2026-challenge-demos \
   --task-names turning_on_radio \
-  --output-dir /tmp/dev/baselines/diffusion_policy/outputs/radio \
+  --output-dir "$DP_DIR/outputs/radio" \
   --max-steps 100000 --batch-size 64 --num-workers 4 --device cuda
 ```
 
@@ -71,11 +72,12 @@ The B1K trainer runs in one process on one GPU (or CPU); it does not implement d
 
 ```bash
 source /tmp/dev/env.sh
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/train_b1k.py \
   --dataset-root /tmp/dev/datasets/2026-challenge-demos \
-  --output-dir /tmp/dev/baselines/diffusion_policy/outputs/radio \
+  --output-dir "$DP_DIR/outputs/radio" \
   --max-steps 110000 --device cuda --num-workers 4 \
-  --resume /tmp/dev/baselines/diffusion_policy/outputs/radio/latest.pt
+  --resume "$DP_DIR/outputs/radio/latest.pt"
 ```
 
 Resume restores architecture, normalization, task selection, model/EMA parameters and EMA counter, AdamW state, seed, batch size, learning rate/weight decay, and Python/NumPy/Torch/CUDA RNG states. Explicit model flags are ignored in favor of the checkpoint. The frame-uniform replacement sampler is independently seeded per optimizer step, so prefetching does not change resumed batch indices. Dataset metadata, selected IDs, file sizes and nanosecond mtimes are fingerprinted to detect selection/mutation mismatches (not a full 3 TB content hash). GPU kernels may still be nondeterministic. Checkpoints use atomic `step-XXXXXXXX.pt` writes and a `latest.pt` symlink; existing step files are never overwritten. `config.json` and `train.jsonl` are run-local.
@@ -99,7 +101,7 @@ Offline regression command (no CUDA initialization or W&B/HF access):
 
 ```bash
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 taskset -c 90-119 .venv/bin/python -m pytest \
   tests/test_b1k.py tests/test_replay_buffer.py::test tests/test_cv2_util.py \
   tests/test_timestamp_accumulator.py -q
@@ -133,7 +135,7 @@ Frame cache (pixel-exact, opt-in `--frame-cache DIR`):
 
 ```bash
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES='' taskset -c 90-119 .venv/bin/python scripts/b1k/build_frame_cache.py \
   --dataset-path /tmp/dev/datasets/2026-challenge-demos --task-names turning_on_radio \
   --cache-dir /tmp/dev/datasets/2026-challenge-demos-frame-cache-96 --image-size 96 --workers 28 --verify 512
@@ -177,8 +179,9 @@ The linear normalizer does **not clip** values outside the fitted range. DDPM/DD
 
 ```bash
 source /tmp/dev/env.sh
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/serve_b1k.py \
-  --model-path /tmp/dev/baselines/diffusion_policy/outputs/radio/latest.pt \
+  --model-path "$DP_DIR/outputs/radio/latest.pt" \
   --host 0.0.0.0 --port 8000 --device cuda --action-horizon 8
 ```
 
@@ -243,7 +246,7 @@ Video is **blocked**, not passed or hidden as a skipped test. Importing its actu
 
 ```bash
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES='' .venv/bin/python -m diffusion_policy.b1k.variant_matrix \
   --dataset-path /tmp/dev/datasets/2026-challenge-demos \
   --task-names turning_on_radio --max-episodes 2 \
