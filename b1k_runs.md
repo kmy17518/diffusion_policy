@@ -1,5 +1,22 @@
 # Transformer Diffusion Policy radio run — 2026-09-16
 
+## Task-name CLIP/FiLM smoke run on the optimized trainer — 2026-09-17 (branch `diffusion_policy_lang_goal`)
+
+After merging the language branch into the throughput work, the radio recipe was launched with `--language-conditioning clip_film --prompt-source task_name` (prompt = the literal `turning_on_radio`), physical batch **8,960**, frame cache, bf16 autocast, TF32, `torch.compile default`, math attention — i.e. the optimized recipe below plus language:
+
+```bash
+source /tmp/dev/env.sh
+tmux -L b1k-act-dp new-session -d -s dp-radio-lang-goal-train \
+  'LANGUAGE_CONDITIONING=clip_film PROMPT_SOURCE=task_name RUN_TAG=lang-goal-20260917 \
+   bash /tmp/dev/baselines/diffusion_policy_lang_goal/scripts/b1k/run_radio_300k.sh'
+```
+
+- Run directory `outputs/turning-on-radio-transformer12x512-clipfilm-taskname-bs8960-300k-lang-goal-20260917/` (worktree), log `/tmp/dev/logs/dp-radio-300k-clipfilm-taskname-bs8960-lang-goal-20260917.log`, W&B run `dpradio16-clipfilm-taskname-bs8960-lang-goal-20260917` (same project), GPU 0 of this host, cores 90-119, trainer commit `6018b73`.
+- First 134 steps: **0.671 s/step** (compute 0.669, data wait 1.4 ms; 13.4k samples/s) versus 0.60 s/step unconditioned; peak allocated **128.6 GiB** versus 157 GiB unconditioned and 189 GiB for the FP32 eager language run. Step 1 (compilation + first batch) took 171 s.
+- Losses: steps 1-5 **1.2110 / 1.3594 / 1.1107 / 0.9696 / 0.9393** (unconditioned optimized run: 1.1988 / 1.2759 / 1.0615 / 0.9384 / 0.9092); mean over steps 6-60 **0.3908** versus 0.3752; all finite, max clipped gradient norm 1.69. The step-1 full checkpoint carries the `language` cache (`openai/clip-vit-large-patch14` @ `32bd6428…`, prompt `turning_on_radio`, `[1, 768]`) and 48 FiLM tensors.
+- Controlled A/B at batch 1,024, 150 steps, same seed, same flags (`/tmp/dev/audits/dp-lang-goal-20260917/ab-bs1024-{none,clipfilm-taskname}/train.jsonl`): none **0.0808 s/step**, step-1 loss 1.1985, mean loss steps 101-150 0.1629; clip_film/task_name **0.0942 s/step**, 1.2114, 0.1739. Peak memory 19.3 vs 16.2 GiB.
+- This is a throughput/loss smoke run launched as a full 300k-step recipe; no uploader was started. Stop it with `tmux -L b1k-act-dp kill-session -t dp-radio-lang-goal-train` if it is not meant to continue.
+
 ## Task-name CLIP/FiLM run
 
 **Stopped by user on 2026-09-17 at 05:15 UTC.** The trainer stopped after recorded step **3,675**; the latest resumable checkpoint is **step 2,500**. Trainer, uploader, scheduled health reviews and failure watcher are stopped. Checkpoints and upload journals remain intact. The historical launch/monitoring statements below describe the earlier running state; do not restart this run without a new request.
