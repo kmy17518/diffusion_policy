@@ -54,7 +54,11 @@ CUDA_VISIBLE_DEVICES=3 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=
   --wandb-project b1k-challenge-2026-diffusion-policy --wandb-group dp-init-20260917
 ```
 
-Use a new output directory for another experiment; the harness rejects overwrite/resume. W&B runs: baseline [`e15394481fef`](https://wandb.ai/kmy17518/b1k-challenge-2026-diffusion-policy/runs/e15394481fef), random FiLM [`03d3cdad2e2e`](https://wandb.ai/kmy17518/b1k-challenge-2026-diffusion-policy/runs/03d3cdad2e2e), identity FiLM [`da0d66e0cc52`](https://wandb.ai/kmy17518/b1k-challenge-2026-diffusion-policy/runs/da0d66e0cc52). These are finite diagnostics with no HF uploader or recurring monitoring. Results will be recorded after verified completion.
+Use a new output directory for another experiment; the harness rejects overwrite/resume. W&B runs: baseline [`e15394481fef`](https://wandb.ai/kmy17518/b1k-challenge-2026-diffusion-policy/runs/e15394481fef), random FiLM [`03d3cdad2e2e`](https://wandb.ai/kmy17518/b1k-challenge-2026-diffusion-policy/runs/03d3cdad2e2e), identity FiLM [`da0d66e0cc52`](https://wandb.ai/kmy17518/b1k-challenge-2026-diffusion-policy/runs/da0d66e0cc52). These are finite diagnostics with no HF uploader or recurring monitoring.
+
+**Stopped intentionally after about 31.5 minutes when the user capped the experiment at one hour.** The common comparison endpoint is **step 500**, fully recorded for all three arms including held-out evaluation; later partial training is excluded. No final DP checkpoint was saved because the original 1,000-step target was interrupted (exit130). The existing long-run checkpoints remain untouched.
+
+Steps401–500 mean training denoising MSE: baseline **0.108824**, random FiLM **0.114095** (+4.84%), identity FiLM **0.113668** (+4.45%). Step500 held-out EMA denoising MSE: baseline **0.037039**, random FiLM **0.042136** (+13.76%), identity FiLM **0.042203** (+13.94%). Online held-out MSE: **0.035663 / 0.042982 / 0.041695**, respectively. Identity improves training MSE by only0.37% relative to random FiLM and is effectively tied on held-out EMA MSE (+0.16%); it does not remove the conditioned gap in this short test. These are single-seed results on128examples from20heldout episodes, not simulator success or proof about the stopped original large-batch run. Analysis and curves: `/tmp/dev/audits/act-dp-identity-init-20260917/comparison-results.{json,md}` and `comparison-curves.png`. All comparison training and monitoring are stopped.
 
 ## Original unconditioned run
 
