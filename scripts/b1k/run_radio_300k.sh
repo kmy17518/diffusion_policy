@@ -9,14 +9,17 @@
 # which is resumed if it holds latest.pt; any other tag names a fresh run with its own log, exit
 # file and W&B run), COMPILE_MODE (default: "reduce-overhead" = CUDA graphs below 4096 samples,
 # where launch overhead dominates; "default" above, where CUDA graphs measured slower),
-# GPU_UUID / CORES (one GPU per run; two runs on one GPU would share it and neither would reach
-# its measured rate), FRAME_CACHE, WANDB_ID. Measured steady state: 0.083 s/step at 1024,
-# 0.60 s/step at 8960, excluding the first minute of compilation and the periodic checkpoint writes
-# that train.jsonl reports separately as checkpoint_s.
+# GPU_UUID (default: this host's GPU 0; one GPU per run; two runs on one GPU would share it and
+# neither would reach its measured rate) / CORES, FRAME_CACHE, WANDB_ID. Measured steady state:
+# 0.083 s/step at 1024, 0.60 s/step at 8960, excluding the first minute of compilation and the
+# periodic checkpoint writes that train.jsonl reports separately as checkpoint_s.
+#
+# Runs from the checkout that contains this script (main clone or any git worktree), using that
+# checkout's .venv and writing its run directory under that checkout's outputs/.
 set -euo pipefail
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
-export CUDA_VISIBLE_DEVICES=${GPU_UUID:-GPU-2f892c97-af70-7c60-d2fa-456c65bd90ce}
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+export CUDA_VISIBLE_DEVICES=${GPU_UUID:-GPU-8a92797c-0df1-b962-f810-3ef2ca82ab80}
 if [[ -n "$(nvidia-smi --id "$CUDA_VISIBLE_DEVICES" --query-compute-apps=pid --format=csv,noheader)" ]]; then
     printf 'Assigned Diffusion Policy GPU is occupied; refusing to start.\n' >&2
     exit 1
