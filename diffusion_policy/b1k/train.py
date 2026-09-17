@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler
 
-from diffusion_policy.b1k.dataset import B1KLeRobotDataset
+from diffusion_policy.b1k.dataset import B1KLeRobotDataset, images_to_float
 from diffusion_policy.b1k.model import POLICY_TARGETS, ModelConfig, build_policy, load_checkpoint
 from diffusion_policy.b1k.robot import CAMERAS
 from diffusion_policy.common.pytorch_util import dict_apply
@@ -154,13 +154,69 @@ def build_optimizer(policy, args):
     common = {'learning_rate': args.learning_rate, 'betas': tuple(args.betas)}
     if args.optimizer == 'upstream':
         if args.variant == 'transformer_hybrid_image':
-            return policy.get_optimizer(transformer_weight_decay=args.weight_decay,
-                                        obs_encoder_weight_decay=args.obs_encoder_weight_decay, **common)
-        if args.variant == 'transformer_lowdim':
-            return policy.get_optimizer(weight_decay=args.weight_decay, **common)
-        raise ValueError('--optimizer upstream requires a transformer variant')
-    return torch.optim.AdamW((p for p in policy.parameters() if p.requires_grad),
-                             lr=args.learning_rate, weight_decay=args.weight_decay, betas=tuple(args.betas))
+            optimizer = policy.get_optimizer(transformer_weight_decay=args.weight_decay,
+                                             obs_encoder_weight_decay=args.obs_encoder_weight_decay, **common)
+        elif args.variant == 'transformer_lowdim':
+            optimizer = policy.get_optimizer(weight_decay=args.weight_decay, **common)
+        else:
+            raise ValueError('--optimizer upstream requires a transformer variant')
+    else:
+        optimizer = torch.optim.AdamW((p for p in policy.parameters() if p.requires_grad),
+                                      lr=args.learning_rate, weight_decay=args.weight_decay, betas=tuple(args.betas))
+    return optimizer
+
+
+def configure_optimizer_kernels(optimizer, fused, device):
+    """Select AdamW's fused CUDA kernel (one launch per group instead of ~10 per tensor).
+
+    The update rule is unchanged; only the kernel implementation differs. Applied after
+    construction *and* after `load_state_dict`, because a checkpoint's param groups restore the
+    implementation flags and the fused kernel needs its step counters on the device.
+    """
+    fused = bool(fused and device.type == 'cuda')
+    for group in optimizer.param_groups:
+        group['fused'] = True if fused else None
+        group['foreach'] = None
+    for state in optimizer.state.values():
+        if 'step' in state and torch.is_tensor(state['step']):
+            state['step'] = state['step'].to(device=device if fused else 'cpu', dtype=torch.float32)
+
+
+class EMAUpdater:
+    """EMAModel.step with the same arithmetic issued as a few multi-tensor kernels.
+
+    Upstream loops over every parameter with `mul_` and `add_(alpha=)`; `_foreach_mul_` /
+    `_foreach_add_` perform exactly those two elementwise operations per tensor. BatchNorm
+    parameters and frozen parameters are copied, as upstream does.
+    """
+
+    def __init__(self, ema, policy):
+        self.ema = ema
+        self.averaged, self.copied = [], []
+        for module, ema_module in zip(policy.modules(), ema.averaged_model.modules()):
+            for param, ema_param in zip(module.parameters(recurse=False), ema_module.parameters(recurse=False)):
+                if isinstance(module, torch.nn.modules.batchnorm._BatchNorm) or not param.requires_grad:
+                    self.copied.append((param, ema_param))
+                else:
+                    self.averaged.append((param, ema_param))
+
+    @torch.no_grad()
+    def step(self):
+        ema = self.ema
+        ema.decay = ema.get_decay(ema.optimization_step)
+        if self.averaged:
+            targets = [ema_param for _, ema_param in self.averaged]
+            torch._foreach_mul_(targets, ema.decay)
+            torch._foreach_add_(targets, [param.data for param, _ in self.averaged], alpha=1 - ema.decay)
+        for param, ema_param in self.copied:
+            ema_param.copy_(param.data)
+        ema.optimization_step += 1
+
+
+def compile_policy(policy, mode):
+    """Compile the two hot modules in place without changing the module tree or state_dict keys."""
+    for module in (policy.obs_encoder, policy.model) if hasattr(policy, 'obs_encoder') else (policy.model,):
+        module.forward = torch.compile(module.forward, mode=mode)
 
 
 def wandb_metadata(args):
@@ -349,6 +405,22 @@ def parser():
     result.add_argument('--cpu-threads', type=int, default=2)
     result.add_argument('--episode-cache-size', type=int, default=8)
     result.add_argument('--parquet-cache-mb', type=int, default=256)
+    result.add_argument('--video-max-open', type=int, default=32,
+                        help='Open decoders kept per worker; cover the files a task spans to avoid reopen costs')
+    result.add_argument('--frame-cache', type=Path,
+                        help='Pixel-exact resized-frame cache built by scripts/b1k/build_frame_cache.py')
+    result.add_argument('--matmul-precision', choices=['highest', 'high', 'medium'], default='highest',
+                        help='torch float32 matmul precision; high enables TF32 tensor cores for the '
+                             'transformer matmuls (cuDNN convolutions already default to TF32)')
+    result.add_argument('--autocast', choices=['none', 'bf16'], default='none',
+                        help='bf16 autocast for the forward pass and loss; parameters, gradients, '
+                             'optimizer and EMA stay FP32')
+    result.add_argument('--compile', choices=['none', 'default', 'reduce-overhead', 'max-autotune-no-cudagraphs'],
+                        default='none', help='torch.compile the observation encoder and denoiser')
+    result.add_argument('--fused-optimizer', action=argparse.BooleanOptionalAction, default=True,
+                        help='Fused AdamW kernel and multi-tensor EMA update on CUDA (same arithmetic)')
+    result.add_argument('--cudnn-benchmark', action=argparse.BooleanOptionalAction, default=True,
+                        help='Let cuDNN time convolution algorithms once for the fixed batch shapes')
     result.add_argument('--max-episodes', type=int, help='Explicit small-data smoke/debug subset')
     return result
 
@@ -359,7 +431,7 @@ def main(argv=None):
     if device.type not in ('cpu', 'cuda'):
         raise ValueError('--device must be cpu, cuda or an indexed CUDA device')
     if (min(args.max_steps, args.batch_size, args.save_every, args.cpu_threads,
-            args.worker_cpu_threads, args.prefetch_factor) < 1 or
+            args.worker_cpu_threads, args.prefetch_factor, args.video_max_open) < 1 or
             min(args.num_workers, args.save_total_limit, args.export_every) < 0):
         raise ValueError('Steps, batch size, save interval, prefetch and CPU threads must be positive; '
                          'workers, retention and export interval nonnegative')
@@ -414,7 +486,8 @@ def run_training(args, device, output):
         dataset = B1KLeRobotDataset(
             args.dataset_path, args.task_names, **config.dataset_kwargs(),
             episode_cache_size=args.episode_cache_size, parquet_cache_mb=args.parquet_cache_mb,
-            max_episodes=args.max_episodes)
+            max_episodes=args.max_episodes, image_dtype='uint8', frame_cache=args.frame_cache,
+            video_max_open=args.video_max_open)
         if checkpoint and (dataset.task_map != checkpoint['task_map'] or
                            [row['episode_index'] for row in dataset.episodes] != checkpoint['selection']['episode_indices'] or
                            dataset.fingerprint() != checkpoint['dataset_fingerprint']):
@@ -432,6 +505,7 @@ def run_training(args, device, output):
             policy.obs_encoder.eval().requires_grad_(False)
         policy.normalizer.requires_grad_(False)
         ema = EMAModel(copy.deepcopy(policy))
+        ema_updater = EMAUpdater(ema, policy) if args.fused_optimizer else None
         optimizer = build_optimizer(policy, args)
         step = 0
         if checkpoint:
@@ -446,6 +520,12 @@ def run_training(args, device, output):
             if checkpoint['rng']['cuda'] is not None and device.type == 'cuda':
                 torch.cuda.set_rng_state_all(checkpoint['rng']['cuda'])
             del checkpoint
+        configure_optimizer_kernels(optimizer, args.fused_optimizer, device)
+        torch.set_float32_matmul_precision(args.matmul_precision)
+        torch.backends.cudnn.benchmark = args.cudnn_benchmark
+        if args.compile != 'none':
+            compile_policy(policy, args.compile)
+        autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.autocast == 'bf16')
         loader = DataLoader(
             dataset, batch_sampler=StepBatchSampler(len(dataset), args.batch_size, step, args.max_steps,
                                                     args.seed, args.loader_batch_size),
@@ -463,14 +543,21 @@ def run_training(args, device, output):
                 compute_start = time.monotonic()
                 data_wait_s = compute_start - wait_start
                 batch = dict_apply(batch, lambda value: value.to(args.device, non_blocking=True))
+                # Images travel as uint8; this reproduces the float32 [0, 1] values bit for bit.
+                batch['obs'] = images_to_float(batch['obs'])
                 optimizer.zero_grad(set_to_none=True)
-                loss = policy.compute_loss(batch)
+                with autocast:
+                    loss = policy.compute_loss(batch)
+                loss.backward()
+                # Checked after backward so the CPU can enqueue it without a device sync in between.
                 if not torch.isfinite(loss):
                     raise RuntimeError(f'Non-finite loss at step {step}')
-                loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0, error_if_nonfinite=True)
                 optimizer.step()
-                ema.step(policy)
+                if ema_updater is not None:
+                    ema_updater.step()
+                else:
+                    ema.step(policy)
                 # Upstream EMA updates parameters only, not BatchNorm running statistics.
                 sync_batchnorm_buffers(policy, ema.averaged_model)
                 step += 1

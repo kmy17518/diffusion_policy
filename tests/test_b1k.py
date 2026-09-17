@@ -13,7 +13,8 @@ import pytest
 import torch
 import zarr
 
-from diffusion_policy.b1k.dataset import B1KLeRobotDataset, EpisodeSequenceIndex, VideoReader
+from diffusion_policy.b1k.dataset import B1KLeRobotDataset, EpisodeSequenceIndex, VideoReader, images_to_float
+from diffusion_policy.b1k.frame_cache import FrameCacheReader, build_frame_cache, verify_frame_cache
 from diffusion_policy.b1k.model import ModelConfig, build_policy, load_policy
 from diffusion_policy.b1k.normalization import fit_normalizer
 from diffusion_policy.b1k.robot import CAMERAS, PROPRIO_KEY, STATE_INDICES, extract_state, resize_rgb
@@ -938,3 +939,240 @@ def test_atomic_save_failure_keeps_previous_checkpoint(tmp_path, monkeypatch):
         atomic_save({'step': 2}, tmp_path / 'step-00000002.pt')
     assert list(tmp_path.iterdir()) == [path]
     assert torch.load(path, weights_only=True)['step'] == 1
+
+
+# --- throughput path: uint8 transport, frame cache, seek, fused optimizer/EMA, compile-friendly model ---
+
+def sequential_frames(path, image_size):
+    """Ground truth: decode a whole video in order, returning {pts_seconds: resized frame}."""
+    frames = {}
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        for frame in container.decode(stream):
+            if frame.pts is not None:
+                frames[round(float(frame.pts * stream.time_base), 6)] = resize_rgb(frame.to_ndarray(format='rgb24'), image_size)
+    return frames
+
+
+def test_images_to_float_is_bit_exact():
+    values = np.arange(256, dtype=np.uint8)
+    reference = torch.from_numpy(values.astype(np.float32) / 255.)
+    converted = images_to_float({'head': torch.from_numpy(values).reshape(1, 1, 16, 16), 'state': torch.ones(2)})
+    assert converted['head'].dtype == torch.float32 and converted['state'].dtype == torch.float32
+    assert torch.equal(converted['head'].flatten(), reference)
+    assert torch.equal(images_to_float(torch.ones(3)), torch.ones(3))
+    if torch.cuda.is_available():
+        assert torch.equal(images_to_float(torch.from_numpy(values).cuda()).cpu(), reference)
+
+
+def test_uint8_image_transport_matches_float_samples(root):
+    reference, compact = make_dataset(root), make_dataset(root, image_dtype='uint8')
+    for index in range(len(reference)):
+        expected, sample = reference[index], compact[index]
+        for camera in CAMERAS:
+            assert sample['obs'][camera].dtype == torch.uint8 and sample['obs'][camera].shape == expected['obs'][camera].shape
+        restored = images_to_float(sample['obs'])
+        for key, value in expected['obs'].items():
+            assert torch.equal(restored[key], value), key
+        assert torch.equal(sample['action'], expected['action'])
+    with pytest.raises(ValueError, match='image_dtype'):
+        make_dataset(root, image_dtype='float16')
+    reference.close()
+    compact.close()
+
+
+def test_video_reader_seek_lead_returns_exact_frames(root):
+    dataset = make_dataset(root)
+    reader = VideoReader(16, max_open=1)
+    for camera in CAMERAS:
+        path = dataset.video_path(dataset.episodes[0], camera)
+        truth = sequential_frames(path, 16)
+        timestamps = sorted(truth)
+        # every frame alone (keyframes included, where the forward lead avoids an extra GOP), and pairs
+        for t in timestamps:
+            np.testing.assert_array_equal(reader.read(path, [t])[0], truth[t])
+        for first, second in zip(timestamps, timestamps[1:]):
+            np.testing.assert_array_equal(reader.read(path, [first, second]), np.stack([truth[first], truth[second]]))
+        # seeking cannot overshoot: the last frame requested right after a fresh open
+        reader.close()
+        np.testing.assert_array_equal(reader.read(path, [timestamps[-1]])[0], truth[timestamps[-1]])
+    reader.close()
+    dataset.close()
+
+
+def test_frame_cache_is_pixel_exact_and_validated(root, tmp_path):
+    dataset = make_dataset(root)
+    cache = tmp_path / 'cache'
+    with pytest.raises(ValueError, match='inside the read-only dataset'):
+        build_frame_cache(dataset, root / 'cache', workers=1, log=lambda *_: None)
+    videos = build_frame_cache(dataset, cache, workers=2, log=lambda *_: None)
+    assert len(videos) == 3
+    for camera in CAMERAS:
+        path = dataset.video_path(dataset.episodes[0], camera)
+        stem = cache / 'videos' / CAMERAS[camera][0] / 'chunk-004'
+        assert {p.name for p in stem.iterdir()} == {'file-000.frames.npy', 'file-000.pts.npy', 'file-000.json'}
+        truth = sequential_frames(path, 16)
+        frames = np.load(stem / 'file-000.frames.npy', mmap_mode='r')
+        pts = np.load(stem / 'file-000.pts.npy')
+        assert frames.shape == (len(truth), 16, 16, 3) and frames.dtype == np.uint8
+        np.testing.assert_allclose(pts, sorted(truth), atol=1e-6)
+        manifest = json.loads((stem / 'file-000.json').read_text())
+        assert manifest['frames'] == len(truth) and manifest['image_size'] == 16
+        assert manifest['source'] == str(path.relative_to(root))
+    assert verify_frame_cache(dataset, cache, samples=len(dataset), log=lambda *_: None) == len(dataset) * 3 * 2
+    # a second build is a no-op (valid entries are skipped) and the reader matches the native decoder exactly
+    before = {p: p.stat().st_mtime_ns for p in cache.rglob('*.npy')}
+    build_frame_cache(dataset, cache, workers=1, log=lambda *_: None)
+    assert {p: p.stat().st_mtime_ns for p in cache.rglob('*.npy')} == before
+    cached = make_dataset(root, frame_cache=cache)
+    assert isinstance(cached._video, FrameCacheReader)
+    for index in range(len(dataset)):
+        expected, sample = dataset[index], cached[index]
+        for key, value in expected['obs'].items():
+            assert torch.equal(sample['obs'][key], value), key
+        assert torch.equal(sample['action'], expected['action'])
+    restored = pickle.loads(pickle.dumps(cached))
+    assert isinstance(restored._video, FrameCacheReader) and not restored._video.entries
+    assert torch.equal(restored[1]['obs']['head'], dataset[1]['obs']['head'])
+    reader = FrameCacheReader(cache, root, 16)
+    head = dataset.video_path(dataset.episodes[0], 'head')
+    with pytest.raises(ValueError, match='timestamps not found'):
+        reader.read(head, [0.555])
+    with pytest.raises(ValueError, match='timestamps not found'):
+        reader.read(head, [99.0])
+    with pytest.raises(ValueError, match='Stale or mismatched'):
+        FrameCacheReader(cache, root, 32).read(head, [0.5])
+    cached.close()
+    dataset.close()
+    # a modified source video invalidates its entry for readers and datasets alike
+    import os
+    stat = head.stat()
+    os.utime(head, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+    with pytest.raises(ValueError, match='Stale or mismatched'):
+        make_dataset(root, frame_cache=cache)
+    with pytest.raises(FileNotFoundError, match='No frame cache entry'):
+        make_dataset(root, frame_cache=tmp_path / 'empty', cameras=['left_wrist'])
+
+
+def test_frame_cache_training_matches_native_training(root, tmp_path):
+    dataset = make_dataset(root, cameras=['head'])
+    cache = tmp_path / 'cache'
+    build_frame_cache(dataset, cache, workers=1, log=lambda *_: None)
+    dataset.close()
+    args = ['--dataset-root', str(root), '--device', 'cpu', '--num-workers', '0', '--batch-size', '2',
+            '--cpu-threads', '1', '--horizon', '4', '--n-action-steps', '3', '--image-size', '16',
+            '--cameras', 'head', '--down-dims', '16', '32', '--diffusion-step-embed-dim', '16',
+            '--num-train-timesteps', '4', '--num-inference-steps', '2', '--max-steps', '2']
+    train_main(args + ['--output-dir', str(tmp_path / 'native')])
+    train_main(args + ['--output-dir', str(tmp_path / 'cached'), '--frame-cache', str(cache)])
+    native, cached = [torch.load(tmp_path / name / 'latest.pt', weights_only=True) for name in ('native', 'cached')]
+    for field in ('model', 'ema_model'):
+        for key, value in native[field].items():
+            torch.testing.assert_close(cached[field][key], value, rtol=0, atol=0)
+    losses = [[json.loads(line)['loss'] for line in (tmp_path / name / 'train.jsonl').read_text().splitlines()]
+              for name in ('native', 'cached')]
+    assert losses[0] == losses[1]
+    config = json.loads((tmp_path / 'cached' / 'config.json').read_text())
+    assert config['training']['frame_cache'] == str(cache)
+
+
+def test_ema_updater_matches_upstream_step():
+    from diffusion_policy.b1k.train import EMAUpdater
+    from diffusion_policy.model.diffusion.ema_model import EMAModel
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(torch.nn.Linear(4, 6), torch.nn.BatchNorm1d(6), torch.nn.Linear(6, 2))
+    model[2].weight.requires_grad_(False)
+    upstream, fused = EMAModel(copy.deepcopy(model)), EMAModel(copy.deepcopy(model))
+    updater = EMAUpdater(fused, model)
+    assert len(updater.averaged) == 3 and len(updater.copied) == 3  # linear0 w/b + linear2 bias | BN w/b + frozen weight
+    for _ in range(5):
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.add_(torch.randn_like(parameter))
+        upstream.step(model)
+        updater.step()
+        assert upstream.optimization_step == fused.optimization_step and upstream.decay == fused.decay
+        for reference, value in zip(upstream.averaged_model.parameters(), fused.averaged_model.parameters()):
+            assert torch.equal(reference, value)
+
+
+def test_configure_optimizer_kernels_cpu_and_resume_state():
+    from diffusion_policy.b1k.train import configure_optimizer_kernels
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model(torch.ones(1, 3)).sum().backward()
+    optimizer.step()
+    configure_optimizer_kernels(optimizer, fused=True, device=torch.device('cpu'))
+    assert all(group['fused'] is None and group['foreach'] is None for group in optimizer.param_groups)
+    for state in optimizer.state.values():
+        assert state['step'].device.type == 'cpu' and state['step'].dtype == torch.float32
+    optimizer.step()
+    if torch.cuda.is_available():
+        cuda_model = torch.nn.Linear(3, 2).cuda()
+        cuda_optimizer = torch.optim.AdamW(cuda_model.parameters(), lr=1e-3)
+        cuda_model(torch.ones(1, 3, device='cuda')).sum().backward()
+        cuda_optimizer.step()
+        cuda_optimizer.load_state_dict(cuda_optimizer.state_dict())
+        configure_optimizer_kernels(cuda_optimizer, fused=True, device=torch.device('cuda'))
+        assert all(group['fused'] is True for group in cuda_optimizer.param_groups)
+        assert all(state['step'].device.type == 'cuda' for state in cuda_optimizer.state.values())
+        cuda_optimizer.step()
+
+
+@pytest.mark.parametrize('kwargs', [{'cond_dim': 10, 'causal_attn': True}, {'time_as_cond': False, 'causal_attn': True},
+                                    {'cond_dim': 10, 'causal_attn': False}])
+def test_transformer_causal_hint_matches_mask_detection(kwargs):
+    from diffusion_policy.model.diffusion.transformer_for_diffusion import TransformerForDiffusion
+    torch.manual_seed(0)
+    model = TransformerForDiffusion(input_dim=5, output_dim=5, horizon=6, n_obs_steps=2, n_layer=2, n_head=2,
+                                    n_emb=16, p_drop_attn=0.0, **kwargs).eval()
+    sample, timestep = torch.randn(3, 6, 5), torch.tensor([1, 2, 3])
+    cond = torch.randn(3, 2, 10) if kwargs.get('cond_dim') else None
+    with torch.no_grad():
+        hinted = model(sample, timestep, cond)
+        # reference: let nn.Transformer* detect causality from the mask itself (upstream behaviour)
+        if model.encoder_only:
+            reference_module, name = model.encoder, 'is_causal'
+        else:
+            reference_module, name = model.decoder, 'tgt_is_causal'
+        original = reference_module.forward
+        seen = {}
+
+        def detect(*args, **call_kwargs):
+            seen[name] = call_kwargs.pop(name)
+            return original(*args, **call_kwargs)
+
+        reference_module.forward = detect
+        reference = model(sample, timestep, cond)
+        reference_module.forward = original
+    assert seen[name] == kwargs['causal_attn']
+    torch.testing.assert_close(hinted, reference, rtol=1e-5, atol=1e-5)
+    # a strictly upper-triangular future token must not influence causal outputs
+    if kwargs['causal_attn'] and not model.encoder_only:
+        perturbed = sample.clone()
+        perturbed[:, -1] += 10
+        with torch.no_grad():
+            assert torch.allclose(model(perturbed, timestep, cond)[:, :-1], hinted[:, :-1], atol=1e-5)
+
+
+def test_crop_randomizer_samples_on_device_within_bounds():
+    from diffusion_policy.model.vision.crop_randomizer import sample_random_image_crops
+    torch.manual_seed(0)
+    images = torch.arange(2 * 3 * 8 * 8, dtype=torch.float32).reshape(2, 3, 8, 8)
+    crops, indices = sample_random_image_crops(images, 5, 6, num_crops=1)
+    assert crops.shape == (2, 1, 3, 5, 6) and indices.device == images.device
+    assert bool((indices[..., 0] >= 0).all()) and bool((indices[..., 0] < 3).all())
+    assert bool((indices[..., 1] >= 0).all()) and bool((indices[..., 1] < 2).all())
+    for image, crop, (h, w) in zip(images, crops[:, 0], indices[:, 0].tolist()):
+        assert torch.equal(crop, image[:, h:h + 5, w:w + 6])
+
+
+def test_train_precision_and_compile_flags_are_recorded(root, tmp_path):
+    output = tmp_path / 'run'
+    train_main(longrun_args(root, output) + ['--max-steps', '1', '--matmul-precision', 'high',
+                                             '--no-fused-optimizer', '--autocast', 'none'])
+    training = json.loads((output / 'config.json').read_text())['training']
+    assert training['matmul_precision'] == 'high' and training['fused_optimizer'] is False
+    assert training['autocast'] == 'none' and training['compile'] == 'none'
+    assert torch.get_float32_matmul_precision() == 'high'
+    torch.set_float32_matmul_precision('highest')

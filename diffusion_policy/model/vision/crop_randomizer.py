@@ -175,10 +175,14 @@ def crop_image_from_indices(images, crop_indices, crop_height, crop_width):
     num_crops = crop_indices.shape[-2]
 
     # make sure @crop_indices are in valid range
-    assert (crop_indices[..., 0] >= 0).all().item()
-    assert (crop_indices[..., 0] < (image_h - crop_height)).all().item()
-    assert (crop_indices[..., 1] >= 0).all().item()
-    assert (crop_indices[..., 1] < (image_w - crop_width)).all().item()
+    # (each .item() forces a device synchronization and would split a torch.compile graph, so the
+    # checks are skipped while compiling; sample_random_image_crops draws in-range offsets by
+    # construction and eager execution keeps the asserts)
+    if not torch.compiler.is_compiling():
+        assert (crop_indices[..., 0] >= 0).all().item()
+        assert (crop_indices[..., 0] < (image_h - crop_height)).all().item()
+        assert (crop_indices[..., 1] >= 0).all().item()
+        assert (crop_indices[..., 1] < (image_w - crop_width)).all().item()
 
     # convert each crop index (ch, cw) into a list of pixel indices that correspond to the entire window.
 
@@ -274,8 +278,10 @@ def sample_random_image_crops(images, crop_height, crop_width, num_crops, pos_en
     # or possibly no leading dimension.
     #
     # Trick: sample in [0, 1) with rand, then re-scale to [0, M) and convert to long to get sampled ints
-    crop_inds_h = (max_sample_h * torch.rand(*source_im.shape[:-3], num_crops).to(device)).long()
-    crop_inds_w = (max_sample_w * torch.rand(*source_im.shape[:-3], num_crops).to(device)).long()
+    # (drawn on the images' device: a host draw plus copy would force a host->device transfer per
+    # call and split torch.compile / CUDA-graph regions; the crop distribution is unchanged)
+    crop_inds_h = (max_sample_h * torch.rand(*source_im.shape[:-3], num_crops, device=device)).long()
+    crop_inds_w = (max_sample_w * torch.rand(*source_im.shape[:-3], num_crops, device=device)).long()
     crop_inds = torch.cat((crop_inds_h.unsqueeze(-1), crop_inds_w.unsqueeze(-1)), dim=-1) # shape [..., N, 2]
 
     crops = crop_image_from_indices(

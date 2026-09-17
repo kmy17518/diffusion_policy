@@ -50,8 +50,28 @@ def _matrix(column):
     return column.flatten().to_numpy(zero_copy_only=False).reshape(len(column), -1).astype(np.float32)
 
 
+def images_to_float(obs):
+    """Convert uint8 image tensors (any device) to float32 in [0, 1]; other values pass through.
+
+    Bit-identical to `image.astype(np.float32) / 255.`: dividing by a 0-dim tensor forces a true
+    IEEE division kernel, whereas a Python scalar divisor becomes a multiply by the reciprocal on
+    CUDA, which is off by one ulp for some of the 256 values.
+    """
+    if isinstance(obs, dict):
+        return {key: images_to_float(value) for key, value in obs.items()}
+    if torch.is_tensor(obs) and obs.dtype == torch.uint8:
+        return torch.div(obs.to(torch.float32), torch.tensor(255., dtype=torch.float32, device=obs.device))
+    return obs
+
+
 class VideoReader:
-    def __init__(self, image_size, tolerance=0.008, max_open=3, cache_frames=64):
+    """Random access into packed videos; one open decoder per file, bounded LRU of both.
+
+    `max_open` should cover the files a worker touches repeatedly: reopening a 200 MB packed
+    MP4 costs ~5 ms (index parse + stream probe), more than decoding a short GOP.
+    """
+
+    def __init__(self, image_size, tolerance=0.008, max_open=32, cache_frames=64):
         self.image_size = image_size
         self.tolerance = tolerance
         self.max_open = max_open
@@ -82,7 +102,15 @@ class VideoReader:
             self.containers.move_to_end(path)
             container = self.containers[path]
             stream = container.streams.video[0]
+            # Backward seek lands on the last keyframe at or before the target. Aiming at
+            # `t + tolerance` (rather than `t - tolerance`) cannot overshoot the wanted frame
+            # as long as consecutive frames are more than 2 * tolerance apart, but it avoids
+            # decoding a whole extra GOP whenever the wanted frame is itself a keyframe. The
+            # decoded frames are identical either way.
             target = max(0, missing[0] - self.tolerance)
+            rate = stream.average_rate
+            if rate and float(rate) > 0 and 1 / float(rate) > 2 * self.tolerance:
+                target = max(0, missing[0] + self.tolerance)
             container.seek(int(target / float(stream.time_base)), stream=stream, backward=True)
             pending = set(missing)
             for frame in container.decode(stream):
@@ -114,15 +142,23 @@ class B1KLeRobotDataset(BaseImageDataset):
                  n_action_steps=8, cameras=tuple(CAMERAS), image_size=96,
                  pad_before=None, pad_after=None, episode_cache_size=8,
                  parquet_cache_mb=256, max_episodes=None, observation_mode='image',
-                 obs_steps=None, imagenet_norm=False):
+                 obs_steps=None, imagenet_norm=False, image_dtype='float32',
+                 frame_cache=None, video_max_open=32):
         self.root = Path(dataset_path).resolve()
         self.info = json.loads((self.root / 'meta/info.json').read_text())
         if not self.info.get('codebase_version', '').startswith('v3'):
             raise ValueError('B1K requires native LeRobot v3 metadata')
         if observation_mode not in ('image', 'lowdim'):
             raise ValueError('observation_mode must be image or lowdim')
+        if image_dtype not in ('float32', 'uint8'):
+            raise ValueError('image_dtype must be float32 (CHW in [0, 1]) or uint8 (CHW, convert with images_to_float)')
+        if video_max_open < 1:
+            raise ValueError('video_max_open must be positive')
         self.observation_mode = observation_mode
         self.imagenet_norm = imagenet_norm
+        self.image_dtype = image_dtype
+        self.frame_cache = None if frame_cache is None else Path(frame_cache).resolve()
+        self.video_max_open = video_max_open
         self.obs_steps = n_obs_steps if obs_steps is None else obs_steps
         if not n_obs_steps <= self.obs_steps <= horizon:
             raise ValueError('obs_steps must be between n_obs_steps and horizon')
@@ -207,6 +243,10 @@ class B1KLeRobotDataset(BaseImageDataset):
             n_action_steps - 1 if pad_after is None else pad_after)
         if not len(self.sampler):
             raise ValueError('No sequences for this horizon and padding')
+        if self.frame_cache is not None:
+            from diffusion_policy.b1k.frame_cache import FrameCacheReader
+            FrameCacheReader(self.frame_cache, self.root, self.image_size).validate(
+                {self.video_path(row, camera) for row in self.episodes for camera in self.cameras})
         self._reset_cache()
 
     def _reset_cache(self):
@@ -214,7 +254,11 @@ class B1KLeRobotDataset(BaseImageDataset):
         self._episodes = OrderedDict()
         self._row_groups = OrderedDict()
         self._row_group_bytes = 0
-        self._video = VideoReader(self.image_size)
+        if self.frame_cache is not None:
+            from diffusion_policy.b1k.frame_cache import FrameCacheReader
+            self._video = FrameCacheReader(self.frame_cache, self.root, self.image_size)
+        else:
+            self._video = VideoReader(self.image_size, max_open=self.video_max_open)
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -321,7 +365,13 @@ class B1KLeRobotDataset(BaseImageDataset):
             if np.any(timestamps >= end + self._video.tolerance):
                 raise ValueError(f'Camera timestamps exceed episode boundary: {camera}')
             images = self._video.read(self.video_path(episode, camera), timestamps)
-            obs[camera] = torch.from_numpy(np.moveaxis(images, -1, 1).astype(np.float32) / 255.)
+            images = np.moveaxis(images, -1, 1)
+            if self.image_dtype == 'uint8':
+                # 4x less loader IPC / pinning / host-to-device traffic; images_to_float on the
+                # device reproduces exactly the float32 values of the branch below.
+                obs[camera] = torch.from_numpy(np.ascontiguousarray(images))
+            else:
+                obs[camera] = torch.from_numpy(images.astype(np.float32) / 255.)
         return {'obs': obs['state'] if self.observation_mode == 'lowdim' else obs,
                 'action': torch.from_numpy(data['action'][frames].copy())}
 

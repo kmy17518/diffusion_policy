@@ -301,7 +301,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
             ]  # each position maps to a (learnable) vector
             x = self.drop(token_embeddings + position_embeddings)
             # (B,T+1,n_emb)
-            x = self.encoder(src=x, mask=self.mask)
+            # `self.mask` is causal by construction; stating it avoids nn.Transformer*'s per-call
+            # mask comparison (a device sync and a torch.compile graph break) with identical results.
+            x = self.encoder(src=x, mask=self.mask, is_causal=self.mask is not None)
             # (B,T+1,n_emb)
             x = x[:,1:,:]
             # (B,T,n_emb)
@@ -333,7 +335,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 tgt=x,
                 memory=memory,
                 tgt_mask=self.mask[:t, :t] if self.mask is not None else None,
-                memory_mask=self.memory_mask[:t, :tc] if self.memory_mask is not None else None
+                memory_mask=self.memory_mask[:t, :tc] if self.memory_mask is not None else None,
+                # any leading square slice of the causal `self.mask` is itself causal; see encoder_only
+                tgt_is_causal=self.mask is not None
             )
             # (B,T,n_emb)
         
