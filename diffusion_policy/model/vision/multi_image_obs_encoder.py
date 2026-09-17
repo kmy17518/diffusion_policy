@@ -21,7 +21,8 @@ class MultiImageObsEncoder(ModuleAttrMixin):
             share_rgb_model: bool=False,
             # renormalize rgb input with imagenet normalization
             # assuming input in [0,1]
-            imagenet_norm: bool=False
+            imagenet_norm: bool=False,
+            language_key: str=None
         ):
         """
         Assumes rgb input: B,C,H,W
@@ -116,6 +117,7 @@ class MultiImageObsEncoder(ModuleAttrMixin):
         rgb_keys = sorted(rgb_keys)
         low_dim_keys = sorted(low_dim_keys)
 
+        self.language_key = language_key
         self.shape_meta = shape_meta
         self.key_model_map = key_model_map
         self.key_transform_map = key_transform_map
@@ -143,7 +145,11 @@ class MultiImageObsEncoder(ModuleAttrMixin):
             # (N*B,C,H,W)
             imgs = torch.cat(imgs, dim=0)
             # (N*B,D)
-            feature = self.key_model_map['rgb'](imgs)
+            if self.language_key is None:
+                feature = self.key_model_map['rgb'](imgs)
+            else:
+                language = obs_dict[self.language_key].repeat(len(self.rgb_keys), 1)
+                feature = self.key_model_map['rgb'](imgs, language)
             # (N,B,D)
             feature = feature.reshape(-1,batch_size,*feature.shape[1:])
             # (B,N,D)
@@ -161,7 +167,10 @@ class MultiImageObsEncoder(ModuleAttrMixin):
                     assert batch_size == img.shape[0]
                 assert img.shape[1:] == self.key_shape_map[key]
                 img = self.key_transform_map[key](img)
-                feature = self.key_model_map[key](img)
+                if self.language_key is None:
+                    feature = self.key_model_map[key](img)
+                else:
+                    feature = self.key_model_map[key](img, obs_dict[self.language_key])
                 features.append(feature)
         
         # process lowdim input

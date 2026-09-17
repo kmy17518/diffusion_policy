@@ -292,6 +292,9 @@ def save_checkpoint(output, policy, ema, optimizer, config, dataset, step, args)
                 'python': random.getstate(),
                 'cuda': torch.cuda.get_rng_state_all() if policy.device.type == 'cuda' else None},
     }
+    if config.language_conditioning == 'clip_film':
+        from diffusion_policy.b1k.language import validate_language_cache
+        checkpoint['language'] = validate_language_cache(dataset.language, dataset.task_map, config.prompt_source)
     path = output / f'step-{step:08d}.pt'
     atomic_save(checkpoint, path)
     publish_full_checkpoint(output, path)
@@ -305,13 +308,16 @@ def save_checkpoint(output, policy, ema, optimizer, config, dataset, step, args)
     return path
 
 
-def export_checkpoint(output, ema, config, task_map, step):
+def export_checkpoint(output, ema, config, task_map, step, language=None):
     checkpoint = {
         'format': 'diffusion_policy_b1k_v1', 'checkpoint_type': 'eval',
         'config': config.to_dict(), 'task_map': task_map,
         'normalizer': ema.averaged_model.normalizer.state_dict(),
         'ema_model': ema.averaged_model.state_dict(), 'step': step,
     }
+    if config.language_conditioning == 'clip_film':
+        from diffusion_policy.b1k.language import validate_language_cache
+        checkpoint['language'] = validate_language_cache(language, task_map, config.prompt_source)
     path = output / 'export_queue' / 'eval' / f'step-{step:08d}.pt'
     atomic_save(checkpoint, path)
     sync_directory(path.parent.parent)
@@ -325,6 +331,12 @@ def gpu_memory_metrics(device):
     return {'gpu_allocated_bytes': torch.cuda.memory_allocated(device),
             'gpu_reserved_bytes': torch.cuda.memory_reserved(device),
             'gpu_peak_allocated_bytes': torch.cuda.max_memory_allocated(device)}
+
+
+class ExplicitLanguageChoice(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f'{self.dest}_explicit', True)
 
 
 def parser():
@@ -341,6 +353,10 @@ def parser():
     result.add_argument('--device', default='cuda')
     result.add_argument('--variant', choices=list(POLICY_TARGETS), default='unet_image')
     result.add_argument('--conditioning', choices=['global', 'local', 'inpainting'], default='global')
+    result.add_argument('--language-conditioning', choices=['none', 'clip_film'], default='none',
+                        action=ExplicitLanguageChoice)
+    result.add_argument('--prompt-source', choices=['task_name', 'task_description'], default='task_name',
+                        action=ExplicitLanguageChoice)
     result.add_argument('--pred-action-steps-only', action='store_true')
     result.add_argument('--prediction-type', choices=['epsilon', 'sample'], default='epsilon')
     result.add_argument('--kernel-size', type=int, default=5)
@@ -448,6 +464,9 @@ def run_training(args, device, output):
         if checkpoint.get('checkpoint_type') == 'eval' or 'optimizer' not in checkpoint:
             raise ValueError('Cannot resume training from an eval-only checkpoint; use a full checkpoint')
         config = ModelConfig(**checkpoint['config'])
+        for key in ('language_conditioning', 'prompt_source'):
+            if getattr(args, f'{key}_explicit', False) and getattr(args, key) != getattr(config, key):
+                raise ValueError(f'--{key.replace("_", "-")} conflicts with the resumed checkpoint')
         if args.task_names is None:
             args.task_names = checkpoint['selection']['task_names']
         if args.max_episodes is None:
@@ -463,6 +482,8 @@ def run_training(args, device, output):
         config = ModelConfig(**values, clip_sample=not args.no_clip_sample)
     config.validate()
     args.variant = config.variant
+    args.language_conditioning = config.language_conditioning
+    args.prompt_source = config.prompt_source
     if args.optimizer == 'upstream' and not config.variant.startswith('transformer_'):
         raise ValueError('--optimizer upstream requires a transformer variant')
     if checkpoint and checkpoint['step'] >= args.max_steps:
@@ -483,6 +504,7 @@ def run_training(args, device, output):
                            [row['episode_index'] for row in dataset.episodes] != checkpoint['selection']['episode_indices'] or
                            dataset.fingerprint() != checkpoint['dataset_fingerprint']):
             raise ValueError('Resume dataset selection, metadata or file fingerprint does not match checkpoint')
+        dataset.prepare_language(checkpoint.get('language') if checkpoint else None)
         print(json.dumps({'episodes': len(dataset.episodes), 'sequences': len(dataset),
                           'task_map': dataset.task_map, 'config': config.to_dict()}), flush=True)
         policy = build_policy(config, dataset.task_map, initialize_encoder=checkpoint is None)
@@ -563,7 +585,7 @@ def run_training(args, device, output):
                 compute_s = time.monotonic() - compute_start
                 checkpoint_start = time.monotonic()
                 if args.export_every and step % args.export_every == 0:
-                    path = export_checkpoint(output, ema, config, dataset.task_map, step)
+                    path = export_checkpoint(output, ema, config, dataset.task_map, step, dataset.language)
                     print(f'Evaluation export: {path}', flush=True)
                 if step % args.save_every == 0 or step == args.max_steps or (args.save_first_step and step == 1):
                     path = save_checkpoint(output, policy, ema, optimizer, config, dataset, step, args)

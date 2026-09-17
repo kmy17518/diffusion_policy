@@ -142,18 +142,28 @@ class B1KLeRobotDataset(BaseImageDataset):
                  n_action_steps=8, cameras=tuple(CAMERAS), image_size=96,
                  pad_before=None, pad_after=None, episode_cache_size=8,
                  parquet_cache_mb=256, max_episodes=None, observation_mode='image',
-                 obs_steps=None, imagenet_norm=False, image_dtype='float32',
-                 frame_cache=None, video_max_open=32):
+                 obs_steps=None, imagenet_norm=False, language_conditioning='none',
+                 prompt_source='task_name', image_dtype='float32', frame_cache=None,
+                 video_max_open=32):
         self.root = Path(dataset_path).resolve()
         self.info = json.loads((self.root / 'meta/info.json').read_text())
         if not self.info.get('codebase_version', '').startswith('v3'):
             raise ValueError('B1K requires native LeRobot v3 metadata')
         if observation_mode not in ('image', 'lowdim'):
             raise ValueError('observation_mode must be image or lowdim')
+        if language_conditioning not in ('none', 'clip_film'):
+            raise ValueError('language_conditioning must be none or clip_film')
+        if prompt_source not in ('task_name', 'task_description'):
+            raise ValueError('prompt_source must be task_name or task_description')
+        if language_conditioning != 'none' and observation_mode != 'image':
+            raise ValueError('clip_film requires image observations')
         if image_dtype not in ('float32', 'uint8'):
             raise ValueError('image_dtype must be float32 (CHW in [0, 1]) or uint8 (CHW, convert with images_to_float)')
         if video_max_open < 1:
             raise ValueError('video_max_open must be positive')
+        self.language_conditioning = language_conditioning
+        self.prompt_source = prompt_source
+        self.language = None
         self.observation_mode = observation_mode
         self.imagenet_norm = imagenet_norm
         self.image_dtype = image_dtype
@@ -175,10 +185,16 @@ class B1KLeRobotDataset(BaseImageDataset):
         self.episode_cache_size = episode_cache_size
         self.parquet_cache_bytes = int(parquet_cache_mb * 1024 ** 2)
         tasks = pq.read_table(self.root / 'meta/tasks.parquet').to_pydict()
-        name_column = next((key for key in ('task', '__index_level_0__', 'task_name') if key in tasks), None)
-        if name_column is None:
+        name_column = next((key for key in ('task_name', 'task', '__index_level_0__') if key in tasks), None)
+        if name_column is None or 'task_index' not in tasks:
             raise ValueError('meta/tasks.parquet must contain task names and task_index')
-        all_tasks = {int(i): str(name) for i, name in zip(tasks['task_index'], tasks[name_column])}
+        ids, raw_names = tasks['task_index'], tasks[name_column]
+        if (any(type(index) is not int for index in ids) or
+                any(not isinstance(name, str) or not name.strip() for name in raw_names)):
+            raise ValueError('meta/tasks.parquet requires integer task_index and nonempty task names')
+        if len(set(ids)) != len(ids) or len(set(raw_names)) != len(raw_names):
+            raise ValueError('Duplicate/conflicting tasks in meta/tasks.parquet')
+        all_tasks = dict(zip(ids, raw_names))
         names = [task_names] if isinstance(task_names, str) else list(task_names or [])
         unknown = set(names) - set(all_tasks.values())
         if unknown:
@@ -248,6 +264,14 @@ class B1KLeRobotDataset(BaseImageDataset):
             FrameCacheReader(self.frame_cache, self.root, self.image_size).validate(
                 {self.video_path(row, camera) for row in self.episodes for camera in self.cameras})
         self._reset_cache()
+
+    def prepare_language(self, checkpoint_language=None):
+        from diffusion_policy.b1k.language import prepare_language
+        cached = self.language if checkpoint_language is None else checkpoint_language
+        self.language = prepare_language(self.root, self.task_map, self.language_conditioning,
+                                         self.prompt_source, cached=cached)
+        self._language_rows = {index: row for row, index in enumerate(sorted(self.task_map))}
+        return self.language
 
     def _reset_cache(self):
         self._pid = os.getpid()
@@ -358,6 +382,11 @@ class B1KLeRobotDataset(BaseImageDataset):
         state = condition_state(data['state'][obs_frames],
                                 np.full(len(obs_frames), episode['task_index']), self.task_map)
         obs = {'state': torch.from_numpy(state)}
+        if self.language_conditioning == 'clip_film':
+            if self.language is None:
+                raise RuntimeError('Call dataset.prepare_language() before loading clip_film samples')
+            embedding = self.language['embeddings'][self._language_rows[episode['task_index']]]
+            obs['lang_emb'] = embedding.expand(len(obs_frames), -1).clone()
         for camera in self.cameras:
             key = CAMERAS[camera][0]
             timestamps = data['timestamp'][obs_frames] + episode[f'videos/{key}/from_timestamp']
@@ -409,6 +438,8 @@ class B1KLeRobotDataset(BaseImageDataset):
             result = LinearNormalizer()
             result['obs'], result['action'] = normalizer['state'], normalizer['action']
             return result
+        if self.language_conditioning == 'clip_film':
+            normalizer['lang_emb'] = SingleFieldLinearNormalizer.create_identity()
         if self.imagenet_norm:
             for camera in self.cameras:
                 normalizer[camera] = SingleFieldLinearNormalizer.create_identity()

@@ -12,6 +12,8 @@ websockets==15.0.1
 msgpack>=1.0,<2
 wandb==0.30.0
 huggingface_hub==0.36.2
+# Lazy-loaded only for initial clip_film task encoding; restore/serve use cached embeddings.
+transformers>=4.46,<5
 # The two hybrid variants use upstream robomimic vision encoders.
 robomimic==0.2.0
 # Upstream Zarr/HDF5 equivalence tests.
