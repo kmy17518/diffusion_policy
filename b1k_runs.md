@@ -22,6 +22,20 @@ These measurements are in `/tmp/dev/audits/act-dp-radio-300k-20260916/`. Batch s
 
 **Throughput work of 2026-09-17** (`/tmp/dev/audits/dp-speed-20260917/`): the pixel-exact frame cache removes the loader bottleneck entirely (data wait ~1 ms), and bf16 autocast + TF32 + `torch.compile` + multi-tensor EMA + plain-matmul attention bring the same recipe to **0.60 s/step at batch 8,960** (157 GiB peak instead of 268) and **0.083 s/step at batch 1,024** (`BATCH_SIZE=1024`; the script selects CUDA graphs below 4,096 samples). A 60-step run at 8,960 reproduced the original run's losses (steps 1-5 within ~1e-3; mean over steps 6-60 0.3752 vs 0.3753). The launch script below now builds/verifies the cache first and passes the new flags; relaunching resumes `latest.pt` with them.
 
+## Comparison run with the throughput work (2026-09-17)
+
+A fresh 300k-step run with the same architecture, batch (8,960), seed and data, launched with the optimized trainer to compare against the original run above:
+
+```bash
+tmux -L b1k-act-dp new-session -d -s dp-radio-fast-train \
+  'RUN_TAG=fast-20260917 GPU_UUID=GPU-2246c972-301d-6778-7a38-bdf1d0e05687 CORES=40-69 \
+   bash /tmp/dev/baselines/diffusion_policy/scripts/b1k/run_radio_300k.sh'
+```
+
+- Directory `outputs/turning-on-radio-transformer12x512-bs8960-300k-fast-20260917/`, log `/tmp/dev/logs/dp-radio-300k-bs8960-fast-20260917.log`, W&B run `dpradio16-bs8960-fast-20260917` (same project), GPU 1, trainer commit `100b106`.
+- First 133 steps: 0.604 s/step versus 10.38 s/step originally; mean loss over steps 11-50 and 51-133 identical to four decimals (0.3641, 0.1800) since both runs see the same batches.
+- No uploader was started for this run (the existing one is bound to the original run's Hub repo); its checkpoints accumulate locally under `export_queue/`.
+
 ## Detached training and uploader
 
 Dedicated tmux server socket name: **`b1k-act-dp`**.
