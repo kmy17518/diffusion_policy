@@ -5,12 +5,16 @@
 #   - pixel-exact 96 px frame cache (built/verified below; a no-op once present) so the loader
 #     needs 8 workers instead of saturating 24 cores with HEVC decoding,
 #   - bf16 autocast + TF32 matmuls + torch.compile of encoder and denoiser, fused AdamW/EMA.
-# BATCH_SIZE=1024 COMPILE_MODE=reduce-overhead is the measured best for the small-batch target;
-# the default (8960, compile mode "default") is the large-batch run.
+# Overrides: BATCH_SIZE (default 8960), COMPILE_MODE (default: "reduce-overhead" = CUDA graphs
+# below 4096 samples, where launch overhead dominates; "default" above, where CUDA graphs measured
+# slower), GPU_UUID / CORES (one GPU per run; two runs on one GPU would share it and neither would
+# reach its measured rate), FRAME_CACHE, WANDB_ID. Measured steady state: 0.083 s/step at 1024,
+# 0.60 s/step at 8960, excluding the first minute of compilation and the periodic checkpoint writes
+# that train.jsonl reports separately as checkpoint_s.
 set -euo pipefail
 source /tmp/dev/env.sh
 cd /tmp/dev/baselines/diffusion_policy
-export CUDA_VISIBLE_DEVICES=GPU-2f892c97-af70-7c60-d2fa-456c65bd90ce
+export CUDA_VISIBLE_DEVICES=${GPU_UUID:-GPU-2f892c97-af70-7c60-d2fa-456c65bd90ce}
 if [[ -n "$(nvidia-smi --id "$CUDA_VISIBLE_DEVICES" --query-compute-apps=pid --format=csv,noheader)" ]]; then
     printf 'Assigned Diffusion Policy GPU is occupied; refusing to start.\n' >&2
     exit 1
@@ -18,14 +22,15 @@ fi
 export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 ARROW_NUM_THREADS=1
 export WANDB_BASE_URL=https://api.wandb.ai WANDB_MODE=online
 BATCH_SIZE=${BATCH_SIZE:-8960}
-COMPILE_MODE=${COMPILE_MODE:-default}
+COMPILE_MODE=${COMPILE_MODE:-$([[ "$BATCH_SIZE" -lt 4096 ]] && echo reduce-overhead || echo default)}
 CORES=${CORES:-90-119}
 DATASET=/tmp/dev/datasets/2026-challenge-demos
 FRAME_CACHE=${FRAME_CACHE:-/tmp/dev/datasets/2026-challenge-demos-frame-cache-96}
 RUN=outputs/turning-on-radio-transformer12x512-bs${BATCH_SIZE}-300k-20260916
-LOG=/tmp/dev/logs/dp-radio-300k-20260916.log
-STATUS=/tmp/dev/logs/dp-radio-300k-20260916.exit
-# The original large-batch run keeps its W&B identity; other batch sizes get their own run ID.
+# The original large-batch run keeps its log, exit-status and W&B identity; other batch sizes get their own.
+SUFFIX=$([[ "$BATCH_SIZE" == 8960 ]] && echo "" || echo "-bs${BATCH_SIZE}")
+LOG=/tmp/dev/logs/dp-radio-300k${SUFFIX}-20260916.log
+STATUS=/tmp/dev/logs/dp-radio-300k${SUFFIX}-20260916.exit
 WANDB_ID=${WANDB_ID:-$([[ "$BATCH_SIZE" == 8960 ]] && echo dpradio16 || echo "dpradio16bs${BATCH_SIZE}")}
 args=()
 if [[ -e "$RUN/latest.pt" ]]; then
