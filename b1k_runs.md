@@ -33,6 +33,29 @@ Qualification passed **16 fresh-data optimizer steps at batch 8,960**, then full
 
 The 300,000-step trainer was launched on **2026-09-16 at 18:11 UTC** from commit `81839b5` using the new identities above. It is a fresh run, not the qualification checkpoint. The uploader published `resume/step-00000001.pt` to the new private repo; local SHA-256 and remote LFS SHA-256 matched (`9bdc0c34356379fefa5de3c4e0f223c61a75f23343d7e095a60241fbaf6b9014`). The original checkpoint repo was untouched. A session monitor checks both trainers/uploaders every 30 seconds, and a durable 10-minute health review checks loss, timings and publication status. Training is **in progress**, not complete; no simulator success rate is claimed. Local qualification and monitoring artifacts use `/tmp/dev/audits/act-dp-language-20260916/`. Tmux survives client disconnects, not machine/container termination.
 
+## Controlled short initialization comparison — 2026-09-17
+
+A separate diagnostic uses the full 12-layer/512-width DP architecture above with **1,000 steps per arm**, physical batch **512**, and seed **42**. Three arms share identical initial parameters/buffers: unconditioned baseline, randomly initialized FiLM, and identity-initialized FiLM (`beta=gamma=0`). All three camera encoders and transformer tensors are explicitly mapped. In both language arms, added language columns of the observation projection start at zero; original columns are copied in their actual feature order. This isolates FiLM initialization instead of conflating it with the added direct language input.
+
+Each arm receives the same minibatch and paired crops/dropout/diffusion noise/timesteps. Every tenth sorted episode is held out: **180 train / 20 held-out episodes**; exact normalization uses training episodes only. Fixed 128-example held-out evaluation uses identical noise/timesteps, center crops and dropout disabled, for both online and EMA weights. It measures denoising MSE, not action error or simulator success.
+
+This smaller-batch, single-seed diagnostic is not directly comparable at equal steps to the stopped batch-8,960 run. Initial full-GPU baseline/identity losses matched exactly; maximum prediction difference was below `3e-6` from the wider matrix accumulation. The harness, CPU tests and GPU smoke passed before launch (harness commit `386fc5f`).
+
+```bash
+source /tmp/dev/env.sh
+CUDA_VISIBLE_DEVICES=3 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  PYTORCH_ALLOC_CONF=expandable_segments:True WANDB_BASE_URL=https://api.wandb.ai \
+  taskset -c 90-119 .venv/bin/python scripts/b1k/compare_language_init.py \
+  --dataset-path /tmp/dev/datasets/2026-challenge-demos \
+  --output-dir /tmp/dev/audits/act-dp-identity-init-20260917/dp-1000 \
+  --device cuda:0 --max-steps 1000 --batch-size 512 --num-workers 8 \
+  --eval-samples 128 --eval-batch-size 16 --eval-every 250 \
+  --wandb-mode online --wandb-entity kmy17518 \
+  --wandb-project b1k-challenge-2026-diffusion-policy --wandb-group dp-init-20260917
+```
+
+Use a new output directory for another experiment; the harness rejects overwrite/resume. W&B runs: baseline [`e15394481fef`](https://wandb.ai/kmy17518/b1k-challenge-2026-diffusion-policy/runs/e15394481fef), random FiLM [`03d3cdad2e2e`](https://wandb.ai/kmy17518/b1k-challenge-2026-diffusion-policy/runs/03d3cdad2e2e), identity FiLM [`da0d66e0cc52`](https://wandb.ai/kmy17518/b1k-challenge-2026-diffusion-policy/runs/da0d66e0cc52). These are finite diagnostics with no HF uploader or recurring monitoring. Results will be recorded after verified completion.
+
 ## Original unconditioned run
 
 ## Configuration
