@@ -13,6 +13,10 @@
 # neither would reach its measured rate) / CORES, FRAME_CACHE, WANDB_ID. Measured steady state:
 # 0.083 s/step at 1024, 0.60 s/step at 8960, excluding the first minute of compilation and the
 # periodic checkpoint writes that train.jsonl reports separately as checkpoint_s.
+# LANGUAGE_CONDITIONING (default none; "clip_film" adds frozen CLIP task-prompt FiLM conditioning,
+# see b1k.md "Optional CLIP language + FiLM") with PROMPT_SOURCE (default task_name, the raw
+# snake_case task id; or task_description). Language runs get "clipfilm-<source>-" in their run
+# directory, log, exit file and W&B identities, so they never resume an unconditioned run.
 #
 # Runs from the checkout that contains this script (main clone or any git worktree), using that
 # checkout's .venv and writing its run directory under that checkout's outputs/.
@@ -32,10 +36,20 @@ CORES=${CORES:-90-119}
 DATASET=/tmp/dev/datasets/2026-challenge-demos
 FRAME_CACHE=${FRAME_CACHE:-/tmp/dev/datasets/2026-challenge-demos-frame-cache-96}
 RUN_TAG=${RUN_TAG:-20260916}
-RUN=outputs/turning-on-radio-transformer12x512-bs${BATCH_SIZE}-300k-${RUN_TAG}
-# The original large-batch run keeps its log, exit-status and W&B identity; any other batch size
-# or tag gets its own.
-IDENT="bs${BATCH_SIZE}-${RUN_TAG}"
+LANGUAGE_CONDITIONING=${LANGUAGE_CONDITIONING:-none}
+PROMPT_SOURCE=${PROMPT_SOURCE:-task_name}
+case "$LANGUAGE_CONDITIONING/$PROMPT_SOURCE" in
+    none/task_name) LANG_TAG=''; lang_args=() ;;
+    clip_film/task_name|clip_film/task_description)
+        LANG_TAG="clipfilm-${PROMPT_SOURCE//_/}-"
+        lang_args=(--language-conditioning clip_film --prompt-source "$PROMPT_SOURCE") ;;
+    *) printf 'LANGUAGE_CONDITIONING must be none or clip_film; PROMPT_SOURCE task_name or task_description (clip_film only)\n' >&2
+       exit 1 ;;
+esac
+RUN=outputs/turning-on-radio-transformer12x512-${LANG_TAG}bs${BATCH_SIZE}-300k-${RUN_TAG}
+# The original large-batch run keeps its log, exit-status and W&B identity; any other batch size,
+# tag or language setting gets its own.
+IDENT="${LANG_TAG}bs${BATCH_SIZE}-${RUN_TAG}"
 if [[ "$IDENT" == bs8960-20260916 ]]; then
     LOG=/tmp/dev/logs/dp-radio-300k-20260916.log
     STATUS=/tmp/dev/logs/dp-radio-300k-20260916.exit
@@ -58,6 +72,7 @@ CUDA_VISIBLE_DEVICES='' taskset -c "$CORES" .venv/bin/python -u scripts/b1k/buil
 taskset -c "$CORES" .venv/bin/python -u scripts/b1k/train_b1k.py \
     --dataset-path "$DATASET" --task-names turning_on_radio \
     --output-dir "$RUN" --max-steps 300000 --variant transformer_hybrid_image \
+    "${lang_args[@]}" \
     --n-layer 12 --n-emb 512 --n-head 8 --conditioning global \
     --horizon 16 --n-obs-steps 2 --n-action-steps 8 --image-size 96 --crop-shape 86 86 \
     --scheduler ddpm --num-train-timesteps 100 --num-inference-steps 100 \
@@ -68,7 +83,7 @@ taskset -c "$CORES" .venv/bin/python -u scripts/b1k/train_b1k.py \
     --matmul-precision high --autocast bf16 --compile "$COMPILE_MODE" \
     --save-every 2500 --save-first-step --save-total-limit 3 --export-every 10000 \
     --wandb-mode online --wandb-entity kmy17518 --wandb-project b1k-challenge-2026-diffusion-policy \
-    --wandb-name "turning-on-radio-transformer12x512-bs${BATCH_SIZE}-300k$([[ "$RUN_TAG" == 20260916 ]] || echo "-${RUN_TAG}")" --wandb-id "$WANDB_ID" \
+    --wandb-name "turning-on-radio-transformer12x512-${LANG_TAG}bs${BATCH_SIZE}-300k$([[ "$RUN_TAG" == 20260916 ]] || echo "-${RUN_TAG}")" --wandb-id "$WANDB_ID" \
     "${args[@]}" >>"$LOG" 2>&1
 rc=$?
 printf '%s\n' "$rc" >"$STATUS.tmp"
