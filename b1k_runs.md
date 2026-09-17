@@ -2,6 +2,8 @@
 
 ## Task-name CLIP/FiLM run
 
+**Stopped by user on 2026-09-17 at 05:15 UTC.** The trainer stopped after recorded step **3,675**; the latest resumable checkpoint is **step 2,500**. Trainer, uploader, scheduled health reviews and failure watcher are stopped. Checkpoints and upload journals remain intact. The historical launch/monitoring statements below describe the earlier running state; do not restart this run without a new request.
+
 The language-conditioned reproduction uses the same radio subset, **300,000 steps**, physical batch **8,960**, 12-layer/512-width transformer, FP32 optimizer, image/crop sizes, CPU affinity and checkpoint schedule below, with `--language-conditioning clip_film --prompt-source task_name`. The original one-hot task input remains. Frozen CLIP ViT-L/14 projected embeddings condition every camera's ResNet residual blocks through FiLM and are included in the observation features, as in the RoboCasa baseline. Conditioned GroupNorm blocks use activation recomputation to retain the original physical batch; this is not gradient accumulation or mixed precision.
 
 The new run has separate local, Hugging Face and W&B identities; it never resumes or replaces the original run:
