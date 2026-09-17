@@ -8,17 +8,19 @@
 - Three independent robomimic ResNet18/spatial-softmax camera encoders, GroupNorm, 96x96 input and 86x86 training crop.
 - Observation history 2, prediction horizon 16, executed action horizon 8; categorical task input and original 23-D R1Pro actions.
 - DDPM, 100 train/inference diffusion timesteps, epsilon target, global observation conditioning, causal attention, attention dropout 0.3.
-- FP32 AdamW, learning rate `1e-4`, weight decay `1e-6`, betas 0.9/0.999. EMA weights are used for serving. No mixed precision or gradient accumulation.
-- Physical batch **8,960**. Loader slices of 128 are reassembled before the optimizer update without changing batch/sample order.
-- GPU 3 (`GPU-2f892c97-af70-7c60-d2fa-456c65bd90ce`), CPU affinity **90-119**, 24 one-thread workers, two main torch threads, prefetch factor 1, episode cache 200 per worker.
+- AdamW (FP32 parameters, gradients, optimizer state and EMA), learning rate `1e-4`, weight decay `1e-6`, betas 0.9/0.999. EMA weights are used for serving. No gradient accumulation. Since 2026-09-17 the recipe runs the forward pass under bf16 autocast with TF32 matmuls and `torch.compile` (see `b1k.md`, "Throughput"); the first 3,802 steps of the existing run were FP32 eager.
+- Physical batch **8,960**, one loader task per optimizer batch (no slicing needed with the frame cache).
+- GPU 3 (`GPU-2f892c97-af70-7c60-d2fa-456c65bd90ce`), CPU affinity **90-119**, 8 one-thread workers reading the pixel-exact frame cache `/tmp/dev/datasets/2026-challenge-demos-frame-cache-96` (built and verified by the launch script), two main torch threads, prefetch factor 1, episode cache 200 per worker.
 
 The 130-CPU container budget leaves 30 cores for each of the two other training runs, 30 for ACT, 30 for DP, and approximately ten for upload/system work. Process affinity bounds these jobs; it is not an exclusive OS CPU reservation.
 
 ## Batch qualification
 
-Physical FP32 probes passed 512, 8192, 8704, 8960 and 9088; 9120, 9152 and 9216 ran out of memory. A fresh-data pipeline run at 9088 ran out of memory on step 5 despite passing a repeated-input probe, so it was rejected. **8960 passed a 16-step fresh-data run** including online W&B, exact stats, three-checkpoint retention, and eval exports. Compute was approximately 2.2 seconds/step; native-video loading under the 30-core limit brought end-to-end steps to roughly 10-11 seconds. The requested largest stable physical batch is therefore CPU-input-bound; no throughput-optimal smaller batch was substituted.
+Physical FP32 probes passed 512, 8192, 8704, 8960 and 9088; 9120, 9152 and 9216 ran out of memory. A fresh-data pipeline run at 9088 ran out of memory on step 5 despite passing a repeated-input probe, so it was rejected. **8960 passed a 16-step fresh-data run** including online W&B, exact stats, three-checkpoint retention, and eval exports. In FP32 eager mode compute was approximately 2.2 seconds/step and native-video loading under the 30-core limit brought end-to-end steps to roughly 10-11 seconds (the run logged 10.3 s/step over its first 3,802 steps).
 
-These measurements are in `/tmp/dev/audits/act-dp-radio-300k-20260916/`. Batch selection used practical aligned sizes near the OOM boundary, not every individual integer. The actual detached run uses the same tested architecture, batch, data and optimizer configuration.
+These measurements are in `/tmp/dev/audits/act-dp-radio-300k-20260916/`. Batch selection used practical aligned sizes near the OOM boundary, not every individual integer.
+
+**Throughput work of 2026-09-17** (`/tmp/dev/audits/dp-speed-20260917/`): the pixel-exact frame cache removes the loader bottleneck entirely (data wait ~1 ms), and bf16 autocast + TF32 + `torch.compile` + fused AdamW/EMA bring the same recipe to **0.60 s/step at batch 8,960** (157 GiB peak instead of 268) and **0.10 s/step at batch 1,024** (`BATCH_SIZE=1024 COMPILE_MODE=reduce-overhead`). A 60-step run at 8,960 reproduced the original run's losses (steps 1-5 within ~1e-3; mean over steps 6-60 0.3752 vs 0.3753). The launch script below now builds/verifies the cache first and passes the new flags; relaunching resumes `latest.pt` with them.
 
 ## Detached training and uploader
 
