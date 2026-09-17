@@ -7,6 +7,9 @@ data_local
 .vscode
 _wandb
 
+# Project-local Python environment (uv venv --python 3.11 .venv; see b1k.md "Environment")
+.venv/
+
 **/.DS_Store
 
 fuse.cfg
