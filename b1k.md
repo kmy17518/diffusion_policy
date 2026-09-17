@@ -116,7 +116,7 @@ Measured 2026-09-17 on one Blackwell GPU (sm_103, 276 GiB) with 30 Grace cores, 
 | Original: FP32 eager, native loader, 24 workers | ~1.0 s (loader bound) | 10.3 s (8.1 s data wait) | 268 GiB |
 | Native loader fixes (LRU, seek, uint8 transport) | 0.63 s (loader bound) | ~5.6 s (loader bound) | 268 GiB |
 | Frame cache: loader no longer limiting | 0.33 s (GPU bound) | 2.20 s (GPU bound) | 268 GiB |
-| + TF32 matmuls, fused AdamW, multi-tensor EMA | 0.21 s | 1.59 s | 268 GiB |
+| + TF32 matmuls, multi-tensor EMA update | 0.21 s | 1.59 s | 268 GiB |
 | + `torch.compile` (single graphs for encoder and denoiser) | 0.14 s | 0.97 s | 257 GiB |
 | + bf16 autocast, `cudnn.benchmark` | 0.14 s | **0.59 s** | 157 GiB |
 | + CUDA graphs (`--compile reduce-overhead`) | **0.10 s** | 0.75 s (slower; do not use) | 157 GiB |
@@ -143,7 +143,7 @@ CUDA_VISIBLE_DEVICES='' taskset -c 90-119 .venv/bin/python scripts/b1k/build_fra
 GPU (opt-in, chosen by the recipe script):
 
 - `--matmul-precision high` uses TF32 tensor cores for the transformer matmuls; cuDNN convolutions default to TF32 in PyTorch already.
-- `--fused-optimizer` (default on for CUDA) selects AdamW's fused kernel and updates the EMA with `_foreach_mul_`/`_foreach_add_`, the same two elementwise operations `EMAModel.step` issues per tensor (regression test: bit-identical to upstream over several steps, BatchNorm and frozen parameters copied as upstream does). Checkpoint contents are unchanged; fused step counters are moved between host and device on resume.
+- `--multi-tensor-ema` (default on) updates the EMA with `_foreach_mul_`/`_foreach_add_`, the same two elementwise operations `EMAModel.step` issues per tensor, in a handful of launches instead of 850 (regression tests: bit-identical to upstream over several steps and in a trained checkpoint; BatchNorm and frozen parameters copied as upstream does). AdamW keeps PyTorch's default multi-tensor implementation; its fused kernel measured slower for these 425 tensors (5.1 vs 3.6 ms).
 - `--compile default` compiles the observation encoder and denoiser in place (`module.forward = torch.compile(module.forward)`, so `state_dict` keys are untouched). Two upstream constructs prevented single graphs: `crop_randomizer.crop_image_from_indices` asserted its in-range crop offsets with `.item()` (a device sync each; now skipped only while compiling, offsets are drawn in range by construction) and drew the offsets with the host RNG plus a copy (now drawn on the images' device, same distribution); `nn.TransformerDecoder`/`Encoder` compared the registered causal mask against a generated one with `bool(tensor)` on every call (now told `is_causal` explicitly, which is exactly what that comparison concluded, with identical outputs; regression test). Inductor's decomposed attention is also what makes 16-token attention cheap: cuDNN's flash kernels spent 180 ms/step padding 128x128 tiles.
 - `--autocast bf16` runs the forward pass in bf16 with FP32 GroupNorm/LayerNorm/softmax/loss (PyTorch's autocast policy); it halves activation memory (268 -> 157 GiB at batch 8,960).
 - `--compile reduce-overhead` (CUDA graphs) removes launch overhead, which dominates at batch 1,024 (0.14 -> 0.10 s); at batch 8,960 it measured slower than `default` and is not used there.

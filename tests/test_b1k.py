@@ -1096,29 +1096,6 @@ def test_ema_updater_matches_upstream_step():
             assert torch.equal(reference, value)
 
 
-def test_configure_optimizer_kernels_cpu_and_resume_state():
-    from diffusion_policy.b1k.train import configure_optimizer_kernels
-    model = torch.nn.Linear(3, 2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    model(torch.ones(1, 3)).sum().backward()
-    optimizer.step()
-    configure_optimizer_kernels(optimizer, fused=True, device=torch.device('cpu'))
-    assert all(group['fused'] is None and group['foreach'] is None for group in optimizer.param_groups)
-    for state in optimizer.state.values():
-        assert state['step'].device.type == 'cpu' and state['step'].dtype == torch.float32
-    optimizer.step()
-    if torch.cuda.is_available():
-        cuda_model = torch.nn.Linear(3, 2).cuda()
-        cuda_optimizer = torch.optim.AdamW(cuda_model.parameters(), lr=1e-3)
-        cuda_model(torch.ones(1, 3, device='cuda')).sum().backward()
-        cuda_optimizer.step()
-        cuda_optimizer.load_state_dict(cuda_optimizer.state_dict())
-        configure_optimizer_kernels(cuda_optimizer, fused=True, device=torch.device('cuda'))
-        assert all(group['fused'] is True for group in cuda_optimizer.param_groups)
-        assert all(state['step'].device.type == 'cuda' for state in cuda_optimizer.state.values())
-        cuda_optimizer.step()
-
-
 @pytest.mark.parametrize('kwargs', [{'cond_dim': 10, 'causal_attn': True}, {'time_as_cond': False, 'causal_attn': True},
                                     {'cond_dim': 10, 'causal_attn': False}])
 def test_transformer_causal_hint_matches_mask_detection(kwargs):
@@ -1170,9 +1147,17 @@ def test_crop_randomizer_samples_on_device_within_bounds():
 def test_train_precision_and_compile_flags_are_recorded(root, tmp_path):
     output = tmp_path / 'run'
     train_main(longrun_args(root, output) + ['--max-steps', '1', '--matmul-precision', 'high',
-                                             '--no-fused-optimizer', '--autocast', 'none'])
+                                             '--no-multi-tensor-ema', '--autocast', 'none'])
     training = json.loads((output / 'config.json').read_text())['training']
-    assert training['matmul_precision'] == 'high' and training['fused_optimizer'] is False
+    assert training['matmul_precision'] == 'high' and training['multi_tensor_ema'] is False
     assert training['autocast'] == 'none' and training['compile'] == 'none'
     assert torch.get_float32_matmul_precision() == 'high'
     torch.set_float32_matmul_precision('highest')
+    # the multi-tensor EMA path trains identically to upstream's per-parameter loop
+    reference, multi = tmp_path / 'ema-upstream', tmp_path / 'ema-multi'
+    train_main(longrun_args(root, reference) + ['--max-steps', '3', '--no-multi-tensor-ema'])
+    train_main(longrun_args(root, multi) + ['--max-steps', '3'])
+    states = [torch.load(path / 'latest.pt', weights_only=True) for path in (reference, multi)]
+    assert states[0]['ema_step'] == states[1]['ema_step'] == 3
+    for key, value in states[0]['ema_model'].items():
+        assert torch.equal(states[1]['ema_model'][key], value), key

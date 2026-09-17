@@ -166,28 +166,14 @@ def build_optimizer(policy, args):
     return optimizer
 
 
-def configure_optimizer_kernels(optimizer, fused, device):
-    """Select AdamW's fused CUDA kernel (one launch per group instead of ~10 per tensor).
-
-    The update rule is unchanged; only the kernel implementation differs. Applied after
-    construction *and* after `load_state_dict`, because a checkpoint's param groups restore the
-    implementation flags and the fused kernel needs its step counters on the device.
-    """
-    fused = bool(fused and device.type == 'cuda')
-    for group in optimizer.param_groups:
-        group['fused'] = True if fused else None
-        group['foreach'] = None
-    for state in optimizer.state.values():
-        if 'step' in state and torch.is_tensor(state['step']):
-            state['step'] = state['step'].to(device=device if fused else 'cpu', dtype=torch.float32)
-
-
 class EMAUpdater:
     """EMAModel.step with the same arithmetic issued as a few multi-tensor kernels.
 
-    Upstream loops over every parameter with `mul_` and `add_(alpha=)`; `_foreach_mul_` /
-    `_foreach_add_` perform exactly those two elementwise operations per tensor. BatchNorm
-    parameters and frozen parameters are copied, as upstream does.
+    Upstream loops over every parameter with `mul_` and `add_(alpha=)` (850 launches for this
+    model); `_foreach_mul_` / `_foreach_add_` perform exactly those two elementwise operations
+    per tensor. BatchNorm parameters and frozen parameters are copied, as upstream does. (AdamW
+    itself already uses PyTorch's multi-tensor implementation on CUDA by default; its fused
+    kernel measured slower for these 425 tensors.)
     """
 
     def __init__(self, ema, policy):
@@ -417,8 +403,8 @@ def parser():
                              'optimizer and EMA stay FP32')
     result.add_argument('--compile', choices=['none', 'default', 'reduce-overhead', 'max-autotune-no-cudagraphs'],
                         default='none', help='torch.compile the observation encoder and denoiser')
-    result.add_argument('--fused-optimizer', action=argparse.BooleanOptionalAction, default=True,
-                        help='Fused AdamW kernel and multi-tensor EMA update on CUDA (same arithmetic)')
+    result.add_argument('--multi-tensor-ema', action=argparse.BooleanOptionalAction, default=True,
+                        help='EMA update through multi-tensor kernels (same arithmetic as EMAModel.step)')
     result.add_argument('--cudnn-benchmark', action=argparse.BooleanOptionalAction, default=True,
                         help='Let cuDNN time convolution algorithms once for the fixed batch shapes')
     result.add_argument('--max-episodes', type=int, help='Explicit small-data smoke/debug subset')
@@ -505,7 +491,7 @@ def run_training(args, device, output):
             policy.obs_encoder.eval().requires_grad_(False)
         policy.normalizer.requires_grad_(False)
         ema = EMAModel(copy.deepcopy(policy))
-        ema_updater = EMAUpdater(ema, policy) if args.fused_optimizer else None
+        ema_updater = EMAUpdater(ema, policy) if args.multi_tensor_ema else None
         optimizer = build_optimizer(policy, args)
         step = 0
         if checkpoint:
@@ -520,7 +506,6 @@ def run_training(args, device, output):
             if checkpoint['rng']['cuda'] is not None and device.type == 'cuda':
                 torch.cuda.set_rng_state_all(checkpoint['rng']['cuda'])
             del checkpoint
-        configure_optimizer_kernels(optimizer, args.fused_optimizer, device)
         torch.set_float32_matmul_precision(args.matmul_precision)
         torch.backends.cudnn.benchmark = args.cudnn_benchmark
         if args.compile != 'none':
