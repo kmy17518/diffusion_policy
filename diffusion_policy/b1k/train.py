@@ -1,6 +1,7 @@
 """Small, native training entrypoint; legacy Hydra workspaces remain unchanged."""
 
 import argparse
+import contextlib
 from contextlib import contextmanager
 import copy
 import fcntl
@@ -14,6 +15,7 @@ import uuid
 
 import numpy as np
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader, Sampler
 
 from diffusion_policy.b1k.dataset import B1KLeRobotDataset, images_to_float
@@ -403,6 +405,9 @@ def parser():
                              'optimizer and EMA stay FP32')
     result.add_argument('--compile', choices=['none', 'default', 'reduce-overhead', 'max-autotune-no-cudagraphs'],
                         default='none', help='torch.compile the observation encoder and denoiser')
+    result.add_argument('--sdpa-backend', choices=['math', 'auto'], default='math',
+                        help='Attention kernels for training: math (plain matmul/softmax, best for the short '
+                             'action/observation sequences of these policies) or PyTorch auto-selection')
     result.add_argument('--multi-tensor-ema', action=argparse.BooleanOptionalAction, default=True,
                         help='EMA update through multi-tensor kernels (same arithmetic as EMAModel.step)')
     result.add_argument('--cudnn-benchmark', action=argparse.BooleanOptionalAction, default=True,
@@ -509,8 +514,13 @@ def run_training(args, device, output):
         torch.set_float32_matmul_precision(args.matmul_precision)
         torch.backends.cudnn.benchmark = args.cudnn_benchmark
         if args.compile != 'none':
+            # The attention backend gets baked into the traced graphs, and neither the AOT-autograd
+            # nor the Inductor cache key includes the backend flags; keep the artifacts apart.
+            torch.compiler.config.cache_key_tag = f'b1k-sdpa-{args.sdpa_backend}'
             compile_policy(policy, args.compile)
         autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.autocast == 'bf16')
+        attention = (partial(sdpa_kernel, [SDPBackend.MATH]) if args.sdpa_backend == 'math'
+                     else contextlib.nullcontext)
         loader = DataLoader(
             dataset, batch_sampler=StepBatchSampler(len(dataset), args.batch_size, step, args.max_steps,
                                                     args.seed, args.loader_batch_size),
@@ -531,9 +541,10 @@ def run_training(args, device, output):
                 # Images travel as uint8; this reproduces the float32 [0, 1] values bit for bit.
                 batch['obs'] = images_to_float(batch['obs'])
                 optimizer.zero_grad(set_to_none=True)
-                with autocast:
-                    loss = policy.compute_loss(batch)
-                loss.backward()
+                with attention():
+                    with autocast:
+                        loss = policy.compute_loss(batch)
+                    loss.backward()
                 # Checked after backward so the CPU can enqueue it without a device sync in between.
                 if not torch.isfinite(loss):
                     raise RuntimeError(f'Non-finite loss at step {step}')

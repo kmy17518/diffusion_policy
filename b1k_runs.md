@@ -20,7 +20,7 @@ Physical FP32 probes passed 512, 8192, 8704, 8960 and 9088; 9120, 9152 and 9216 
 
 These measurements are in `/tmp/dev/audits/act-dp-radio-300k-20260916/`. Batch selection used practical aligned sizes near the OOM boundary, not every individual integer.
 
-**Throughput work of 2026-09-17** (`/tmp/dev/audits/dp-speed-20260917/`): the pixel-exact frame cache removes the loader bottleneck entirely (data wait ~1 ms), and bf16 autocast + TF32 + `torch.compile` + fused AdamW/EMA bring the same recipe to **0.60 s/step at batch 8,960** (157 GiB peak instead of 268) and **0.10 s/step at batch 1,024** (`BATCH_SIZE=1024 COMPILE_MODE=reduce-overhead`). A 60-step run at 8,960 reproduced the original run's losses (steps 1-5 within ~1e-3; mean over steps 6-60 0.3752 vs 0.3753). The launch script below now builds/verifies the cache first and passes the new flags; relaunching resumes `latest.pt` with them.
+**Throughput work of 2026-09-17** (`/tmp/dev/audits/dp-speed-20260917/`): the pixel-exact frame cache removes the loader bottleneck entirely (data wait ~1 ms), and bf16 autocast + TF32 + `torch.compile` + multi-tensor EMA + plain-matmul attention bring the same recipe to **0.60 s/step at batch 8,960** (157 GiB peak instead of 268) and **0.083 s/step at batch 1,024** (`BATCH_SIZE=1024 COMPILE_MODE=reduce-overhead`). A 60-step run at 8,960 reproduced the original run's losses (steps 1-5 within ~1e-3; mean over steps 6-60 0.3752 vs 0.3753). The launch script below now builds/verifies the cache first and passes the new flags; relaunching resumes `latest.pt` with them.
 
 ## Detached training and uploader
 

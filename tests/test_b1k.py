@@ -1150,7 +1150,7 @@ def test_train_precision_and_compile_flags_are_recorded(root, tmp_path):
                                              '--no-multi-tensor-ema', '--autocast', 'none'])
     training = json.loads((output / 'config.json').read_text())['training']
     assert training['matmul_precision'] == 'high' and training['multi_tensor_ema'] is False
-    assert training['autocast'] == 'none' and training['compile'] == 'none'
+    assert training['autocast'] == 'none' and training['compile'] == 'none' and training['sdpa_backend'] == 'math'
     assert torch.get_float32_matmul_precision() == 'high'
     torch.set_float32_matmul_precision('highest')
     # the multi-tensor EMA path trains identically to upstream's per-parameter loop
