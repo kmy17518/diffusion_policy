@@ -37,6 +37,20 @@ tmux -L b1k-act-dp new-session -d -s dp-stop-at-5k '/tmp/dev/scripts/dp-stop-at-
 - Run directories `outputs/turning-on-radio-transformer12x512-clipfilm-taskname-norecompute-bs8960-300k-lang-goal-20260917/` and `...-clipfilm-taskname-identity-norecompute-bs8960-300k-lang-goal-20260917/`; logs and W&B ids carry the same `clipfilm-taskname[-identity]-norecompute-bs8960-lang-goal-20260917` identities; trainer commits `5f3ebc0` and `2d1b609`.
 - Early measurements (first 847 / 101 steps): both **0.59 s/step** — the unconditioned recipe's step time — versus 0.67 with recomputation, at **171.8 GiB** peak versus 128.6. Random-init losses match the recomputation-on run to four decimals (1.2110 / 1.3594 / 1.1107 / 0.9695 / 0.9393; mean 6-60 0.3908); identity init starts identically at step 1 (1.2110) and differs from step 2 (1.3586 / 1.1102 / 0.9694 / 0.9393; mean 6-60 0.3907). Final 5,000-step numbers are in the runs' `train.jsonl`, not recorded here.
 
+### RoboCasa365 Diffusion Policy configuration at batch 8,960 — 2026-09-18
+
+The `robocasa365` recipe preset (256 px / 224 px crops, horizon 10, 4-layer condition encoder, no one-hot, CLIP FiLM on the task description, upstream optimizer groups with betas 0.9/0.95 and weight decay 1e-3/1e-6, EMA power 0.75, no gradient clipping; see `b1k.md`) with the batch of the runs above, which at this image size only fits as 4 micro-batches of 2,240 (`--grad-accumulation 4`; single pass would need ~580 GiB). Cosine schedule with 1,000 warmup steps sized for **300k steps**, run stopped by `--max-steps 5000`:
+
+```bash
+source /tmp/dev/env.sh
+tmux -L b1k-act-dp new-session -d -s dp-radio-robocasa365-train \
+  'PRESET=robocasa365 BATCH_SIZE=8960 GRAD_ACCUMULATION=4 MAX_STEPS=5000 LR_SCHEDULE_STEPS=300000 RUN_TAG=20260918 \
+   bash /tmp/dev/baselines/diffusion_policy_lang_goal/scripts/b1k/run_radio_300k.sh'
+```
+
+- Run directory `outputs/turning-on-radio-transformer12x512-robocasa365-clipfilm-taskdescription-ga4-bs8960-5k-20260918/`, log `/tmp/dev/logs/dp-radio-5k-robocasa365-clipfilm-taskdescription-ga4-bs8960-20260918.log`, W&B `dpradio16-robocasa365-clipfilm-taskdescription-ga4-bs8960-20260918`, GPU 0, cores 90-119, trainer commit `aec3ae1`. The launch completed the 256 px frame cache (`/tmp/dev/datasets/2026-challenge-demos-frame-cache-256`, 237 GB, verified).
+- First 48 steps: **3.55 s/step** (compute-bound, 2 ms data wait, 2.5k samples/s), **143.5 GiB** peak; losses 1.2041 / 1.2040 / 1.2057 / 1.2045 / 1.2022 with the learning rate still in warmup (4.7e-6 at step 48). Expected end after ~4.9 h with `step-00005000.pt`.
+
 ## Task-name CLIP/FiLM run
 
 **Stopped by user on 2026-09-17 at 05:15 UTC.** The trainer stopped after recorded step **3,675**; the latest resumable checkpoint is **step 2,500**. Trainer, uploader, scheduled health reviews and failure watcher are stopped. Checkpoints and upload journals remain intact. The historical launch/monitoring statements below describe the earlier running state; do not restart this run without a new request.
