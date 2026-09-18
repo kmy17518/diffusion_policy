@@ -21,8 +21,10 @@
 #                with PROMPT_SOURCE task_description. Adds "robocasa365-" to the identities.
 # Overrides: BATCH_SIZE, GRAD_ACCUMULATION (split each optimizer batch into N micro-batches: same
 # seeded samples per step, one optimizer step per BATCH_SIZE samples, 1/N the activation memory; adds
-# "gaN-" to the identities), LR_SCHEDULE_STEPS (robocasa365 preset: length of the cosine schedule,
-# default 500000), MAX_STEPS, IMAGE_SIZE / CROP (square pixels), RUN_TAG (default 20260916 = the
+# "gaN-" to the identities), LR_SCHEDULER (robocasa365 preset: cosine, the default, or constant = the
+# b1k runs' constant 1e-4 without warmup, tagged "constantlr-"), LR_SCHEDULE_STEPS (robocasa365
+# preset: length of the cosine schedule, default 500000), MAX_STEPS, IMAGE_SIZE / CROP (square
+# pixels), RUN_TAG (default 20260916 = the
 # original run directory, which is resumed if it holds latest.pt; any other tag names a fresh run with
 # its own log, exit file and W&B run), COMPILE_MODE (default: "reduce-overhead" = CUDA graphs below
 # 4096 samples, where launch overhead dominates; "default" above, where CUDA graphs measured slower),
@@ -82,10 +84,17 @@ case "$PRESET" in
         # and storing the activations fits (210 GiB peak on this host), so it is off by default here.
         FILM_RECOMPUTE=${FILM_RECOMPUTE:-off}
         model_args=(--horizon 10 --n-cond-layers 4 --no-task-onehot)
+        LR_SCHEDULER=${LR_SCHEDULER:-cosine}
         LR_SCHEDULE_STEPS=${LR_SCHEDULE_STEPS:-500000}
+        case "$LR_SCHEDULER" in
+            cosine)   sched_args=(--lr-scheduler cosine --lr-warmup-steps 1000 --lr-schedule-steps "$LR_SCHEDULE_STEPS") ;;
+            constant) sched_args=(--lr-scheduler constant --lr-warmup-steps 0)   # the b1k runs' constant 1e-4
+                      PRESET_TAG="${PRESET_TAG}constantlr-" ;;
+            *) printf 'LR_SCHEDULER must be cosine or constant\n' >&2
+               exit 1 ;;
+        esac
         optim_args=(--learning-rate 1e-4 --optimizer upstream --weight-decay 1e-3 --obs-encoder-weight-decay 1e-6
-                    --betas 0.9 0.95 --lr-scheduler cosine --lr-warmup-steps 1000 --lr-schedule-steps "$LR_SCHEDULE_STEPS"
-                    --ema-power 0.75 --grad-clip 0) ;;
+                    --betas 0.9 0.95 "${sched_args[@]}" --ema-power 0.75 --grad-clip 0) ;;
     *) printf 'PRESET must be b1k or robocasa365\n' >&2
        exit 1 ;;
 esac
