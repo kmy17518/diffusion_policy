@@ -37,9 +37,10 @@
 # file and W&B identities, so they never resume an unconditioned run.
 # FILM_INIT (default random; "identity" passes --film-init identity: FiLM projections start at zero so
 # every conditioned block is initially the identity; adds "identity-" to the identities).
-# FILM_RECOMPUTE (default on; "off" passes --no-film-recompute so the FiLM ResNet blocks store their
-# activations instead of recomputing them in backward: same math, ~5% faster steps, more memory;
-# adds "norecompute-" to the identities so the two variants stay separate runs).
+# FILM_RECOMPUTE (b1k default on, robocasa365 default off; "off" passes --no-film-recompute so the FiLM
+# ResNet blocks store their activations instead of recomputing them in backward: same math, faster
+# steps (5-12% at 86 px, 24% at 224 px), more memory; adds "norecompute-" to the identities so the
+# two variants stay separate runs).
 #
 # Runs from the checkout that contains this script (main clone or any git worktree), using that
 # checkout's .venv and writing its run directory under that checkout's outputs/. The body is a
@@ -77,6 +78,9 @@ case "$PRESET" in
         MAX_STEPS=${MAX_STEPS:-250000}
         LANGUAGE_CONDITIONING=${LANGUAGE_CONDITIONING:-clip_film}
         PROMPT_SOURCE=${PROMPT_SOURCE:-task_description}
+        # At 224 px crops the FiLM-block recomputation costs 24% of the step (3.38 -> 2.56 s at 4 x 2,240)
+        # and storing the activations fits (210 GiB peak on this host), so it is off by default here.
+        FILM_RECOMPUTE=${FILM_RECOMPUTE:-off}
         model_args=(--horizon 10 --n-cond-layers 4 --no-task-onehot)
         LR_SCHEDULE_STEPS=${LR_SCHEDULE_STEPS:-500000}
         optim_args=(--learning-rate 1e-4 --optimizer upstream --weight-decay 1e-3 --obs-encoder-weight-decay 1e-6
