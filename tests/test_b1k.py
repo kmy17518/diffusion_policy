@@ -19,7 +19,7 @@ from diffusion_policy.b1k.model import ModelConfig, build_policy, load_policy
 from diffusion_policy.b1k.normalization import fit_normalizer
 from diffusion_policy.b1k.robot import CAMERAS, PROPRIO_KEY, STATE_INDICES, extract_state, resize_rgb
 from diffusion_policy.b1k.serve import B1KPolicySession, WebsocketPolicyServer, packb, unpackb
-from diffusion_policy.b1k.train import StepBatchSampler, main as train_main
+from diffusion_policy.b1k.train import StepBatchSampler, main as train_main, parser as train_parser
 from diffusion_policy.b1k.variant_matrix import matrix_cases
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.sampler import SequenceSampler
@@ -354,7 +354,7 @@ def test_bounded_sampler_resume():
 def test_train_resume_self_contained(root, tmp_path):
     output = tmp_path / 'run'
     args = ['--dataset-root', str(root), '--output-dir', str(output), '--device', 'cpu',
-            '--num-workers', '0', '--batch-size', '1', '--cpu-threads', '1',
+            '--num-workers', '0', '--batch-size', '1', '--cpu-threads', '1', '--task-onehot',
             '--horizon', '4', '--n-action-steps', '3', '--image-size', '16', '--cameras', 'head',
             '--down-dims', '16', '32', '--diffusion-step-embed-dim', '16',
             '--num-train-timesteps', '4', '--num-inference-steps', '2']
@@ -728,7 +728,7 @@ def test_bulk_dataset_fetch_preserves_samples_and_order(root):
 
 def longrun_args(root, output):
     return ['--dataset-path', str(root), '--output-dir', str(output), '--device', 'cpu',
-            '--num-workers', '0', '--batch-size', '3', '--cpu-threads', '1',
+            '--num-workers', '0', '--batch-size', '3', '--cpu-threads', '1', '--task-onehot',
             '--variant', 'transformer_lowdim', '--n-layer', '1', '--n-head', '2', '--n-emb', '16',
             '--horizon', '4', '--n-action-steps', '3', '--num-train-timesteps', '4',
             '--num-inference-steps', '2']
@@ -1060,7 +1060,7 @@ def test_frame_cache_training_matches_native_training(root, tmp_path):
     build_frame_cache(dataset, cache, workers=1, log=lambda *_: None)
     dataset.close()
     args = ['--dataset-root', str(root), '--device', 'cpu', '--num-workers', '0', '--batch-size', '2',
-            '--cpu-threads', '1', '--horizon', '4', '--n-action-steps', '3', '--image-size', '16',
+            '--cpu-threads', '1', '--task-onehot', '--horizon', '4', '--n-action-steps', '3', '--image-size', '16',
             '--cameras', 'head', '--down-dims', '16', '32', '--diffusion-step-embed-dim', '16',
             '--num-train-timesteps', '4', '--num-inference-steps', '2', '--max-steps', '2']
     train_main(args + ['--output-dir', str(tmp_path / 'native')])
@@ -1161,3 +1161,109 @@ def test_train_precision_and_compile_flags_are_recorded(root, tmp_path):
     assert states[0]['ema_step'] == states[1]['ema_step'] == 3
     for key, value in states[0]['ema_model'].items():
         assert torch.equal(states[1]['ema_model'][key], value), key
+
+
+def _small_transformer_flags(**overrides):
+    from dataclasses import replace
+    from diffusion_policy.b1k.variant_matrix import config_flags, matrix_cases
+    return config_flags(replace(matrix_cases()['transformer_hybrid_image-global-ddpm'], encoder_weights=None, **overrides))
+
+
+def test_task_onehot_is_optional_off_by_default_in_cli_and_legacy_in_checkpoints(root, tmp_path):
+    # Dataclass keeps the v1 behavior so checkpoints without the field still get their one-hot channels.
+    legacy = {key: value for key, value in ModelConfig().to_dict().items() if key != 'task_onehot'}
+    assert ModelConfig(**legacy).task_onehot is True
+    assert train_parser().parse_args(['--dataset-path', 'x', '--output-dir', 'y']).task_onehot is False
+    with_onehot = make_dataset(root, task_names=['alpha'])
+    without = make_dataset(root, task_names=['alpha'], task_onehot=False)
+    assert with_onehot[0]['obs']['state'].shape[-1] == 26 and without[0]['obs']['state'].shape[-1] == 25
+    assert without.get_normalizer()['state'].params_dict['scale'].shape == (25,)
+    assert build_policy(ModelConfig(task_onehot=False, **{k: v for k, v in _small_config_dict().items()}),
+                        {3: 'alpha'}).obs_encoder is not None
+    with pytest.raises(ValueError, match='no task conditioning'):
+        build_policy(ModelConfig(task_onehot=False, **_small_config_dict()), {3: 'alpha', 9: 'beta'})
+    # Several tasks are fine again once language carries the task.
+    build_policy(ModelConfig(task_onehot=False, language_conditioning='clip_film', **_small_config_dict()),
+                 {3: 'alpha', 9: 'beta'})
+    output = tmp_path / 'no-onehot'
+    train_main(['--dataset-path', str(root), '--task-names', 'alpha', '--device', 'cpu', '--num-workers', '0',
+                '--batch-size', '2', '--cpu-threads', '1', '--max-steps', '1', '--output-dir', str(output),
+                *_small_transformer_flags(task_onehot=False)])
+    policy, checkpoint = load_policy(output)
+    assert checkpoint['config']['task_onehot'] is False
+    assert policy.normalizer['state'].params_dict['scale'].shape == (25,)
+    session = B1KPolicySession(policy, checkpoint['config'], checkpoint['task_map'])
+    actions = session.act(observation(0.5, task=3))
+    assert actions.shape[-1] == 23 and np.isfinite(actions).all()
+    with pytest.raises(ValueError, match='Unknown task_id'):
+        session.act(observation(0.5, task=77))
+
+
+def _small_config_dict():
+    from dataclasses import replace
+    from diffusion_policy.b1k.variant_matrix import matrix_cases
+    config = replace(matrix_cases()['transformer_hybrid_image-global-ddpm'], encoder_weights=None).to_dict()
+    return {key: value for key, value in config.items() if key not in ('task_onehot', 'language_conditioning')}
+
+
+def test_cosine_schedule_ema_power_and_grad_clip_are_applied_recorded_and_resumed_exactly(root, tmp_path):
+    import math
+    lr, warmup, length = 1e-4, 2, 6
+    args = ['--dataset-path', str(root), '--task-names', 'alpha', '--device', 'cpu', '--num-workers', '0',
+            '--batch-size', '2', '--cpu-threads', '1', '--learning-rate', str(lr), '--lr-scheduler', 'cosine',
+            '--lr-warmup-steps', str(warmup), '--lr-schedule-steps', str(length), '--ema-power', '0.75',
+            '--grad-clip', '0', *_small_transformer_flags(task_onehot=False)]
+    full, resumed = tmp_path / 'full', tmp_path / 'resumed'
+    train_main(args + ['--output-dir', str(full), '--max-steps', '4'])
+    train_main(args + ['--output-dir', str(resumed), '--max-steps', '2'])
+    # Optimizer flags are restored from the checkpoint on resume; pass a different --max-steps to check that
+    # the schedule length stays what the first launch fixed.
+    train_main(args[:args.index('--lr-scheduler')] + ['--output-dir', str(resumed), '--max-steps', '4',
+                                                      '--resume', str(resumed), *_small_transformer_flags(task_onehot=False)])
+
+    def expected(step):  # upstream get_cosine_schedule_with_warmup, one scheduler step per optimizer step
+        current = step - 1
+        if current < warmup:
+            return lr * current / warmup
+        progress = (current - warmup) / max(1, length - warmup)
+        return lr * max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    for path in (full, resumed):
+        rows = [json.loads(line) for line in (path / 'train.jsonl').read_text().splitlines()]
+        logged = {row['step']: row['learning_rate'] for row in rows}
+        for step in range(1, 5):
+            assert math.isclose(logged[step], expected(step), rel_tol=1e-9, abs_tol=1e-12), (path.name, step)
+    full_state = torch.load(full / 'latest.pt', weights_only=True)
+    resumed_state = torch.load(resumed / 'latest.pt', weights_only=True)
+    for field in ('model', 'ema_model'):
+        for key, value in full_state[field].items():
+            torch.testing.assert_close(value, resumed_state[field][key], rtol=0, atol=0)
+    training = resumed_state['training']
+    assert training['lr_scheduler'] == 'cosine' and training['lr_warmup_steps'] == warmup
+    assert training['lr_schedule_steps'] == length and training['ema_power'] == 0.75 and training['grad_clip'] == 0.0
+    assert resumed_state['lr_scheduler']['last_epoch'] == 4
+    assert json.loads((full / 'config.json').read_text())['training']['grad_clip'] == 0.0
+
+
+def test_checkpoints_without_schedule_fields_resume_with_constant_lr_defaults(root, tmp_path):
+    output = tmp_path / 'legacy'
+    args = ['--dataset-path', str(root), '--task-names', 'alpha', '--device', 'cpu', '--num-workers', '0',
+            '--batch-size', '2', '--cpu-threads', '1', '--output-dir', str(output), *_small_transformer_flags()]
+    train_main(args + ['--max-steps', '1'])
+    checkpoint = torch.load(output / 'step-00000001.pt', weights_only=True)
+    for key in ('lr_scheduler', 'lr_warmup_steps', 'lr_schedule_steps', 'ema_power', 'grad_clip'):
+        del checkpoint['training'][key]
+    del checkpoint['lr_scheduler']
+    torch.save(checkpoint, output / 'step-00000001.pt')
+    train_main(args + ['--max-steps', '2', '--resume', str(output)])
+    resumed = torch.load(output / 'latest.pt', weights_only=True)
+    assert resumed['step'] == 2
+    assert resumed['training']['lr_scheduler'] == 'constant' and resumed['training']['ema_power'] == 2 / 3
+    assert resumed['training']['grad_clip'] == 1.0 and resumed['training']['lr_warmup_steps'] == 0
+    rows = [json.loads(line) for line in (output / 'train.jsonl').read_text().splitlines()]
+    assert all(math_isclose(row['learning_rate'], 1e-4) for row in rows)
+
+
+def math_isclose(a, b):
+    import math
+    return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)

@@ -95,7 +95,7 @@ class B1KPolicySession:
             raise ValueError('proprio must have shape (61,) or (B,61)')
         batch_size = len(state)
         ids = self._tasks(obs, batch_size)
-        state = condition_state(extract_state(state), np.asarray(ids), self.task_map)
+        state = condition_state(extract_state(state), np.asarray(ids), self.task_map, self.model_config.task_onehot)
         current = {'state': state}
         if self.language is not None:
             current['lang_emb'] = self.language['embeddings'][[self.language_rows[index] for index in ids]].numpy()

@@ -143,7 +143,7 @@ class B1KLeRobotDataset(BaseImageDataset):
                  pad_before=None, pad_after=None, episode_cache_size=8,
                  parquet_cache_mb=256, max_episodes=None, observation_mode='image',
                  obs_steps=None, imagenet_norm=False, language_conditioning='none',
-                 prompt_source='task_name', image_dtype='float32', frame_cache=None,
+                 prompt_source='task_name', task_onehot=True, image_dtype='float32', frame_cache=None,
                  video_max_open=32):
         self.root = Path(dataset_path).resolve()
         self.info = json.loads((self.root / 'meta/info.json').read_text())
@@ -163,6 +163,7 @@ class B1KLeRobotDataset(BaseImageDataset):
             raise ValueError('video_max_open must be positive')
         self.language_conditioning = language_conditioning
         self.prompt_source = prompt_source
+        self.task_onehot = bool(task_onehot)
         self.language = None
         self.observation_mode = observation_mode
         self.imagenet_norm = imagenet_norm
@@ -380,7 +381,7 @@ class B1KLeRobotDataset(BaseImageDataset):
         data = self._read_episode(episode)
         obs_frames = frames[:self.obs_steps]
         state = condition_state(data['state'][obs_frames],
-                                np.full(len(obs_frames), episode['task_index']), self.task_map)
+                                np.full(len(obs_frames), episode['task_index']), self.task_map, self.task_onehot)
         obs = {'state': torch.from_numpy(state)}
         if self.language_conditioning == 'clip_film':
             if self.language is None:
@@ -418,7 +419,7 @@ class B1KLeRobotDataset(BaseImageDataset):
                 if len(table):
                     yield {
                         'state': condition_state(extract_state(_matrix(table['observation.state'])),
-                                                 table['task_index'].to_numpy(), self.task_map),
+                                                 table['task_index'].to_numpy(), self.task_map, self.task_onehot),
                         'action': _matrix(table['action']),
                     }
 

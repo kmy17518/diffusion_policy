@@ -59,6 +59,9 @@ class ModelConfig:
     freeze_encoder: bool = False
     language_conditioning: str = 'none'
     prompt_source: str = 'task_name'
+    # Append the one-hot task id to the 25-D state. True is the v1 behavior and therefore the dataclass
+    # default (checkpoints without the field keep it); the trainer CLI defaults to --no-task-onehot.
+    task_onehot: bool = True
 
     @property
     def lowdim(self):
@@ -74,7 +77,8 @@ class ModelConfig:
                 'cameras': () if self.lowdim else self.cameras, 'image_size': self.image_size,
                 'observation_mode': 'lowdim' if self.lowdim else 'image',
                 'obs_steps': self.obs_steps, 'imagenet_norm': self.imagenet_norm,
-                'language_conditioning': self.language_conditioning, 'prompt_source': self.prompt_source}
+                'language_conditioning': self.language_conditioning, 'prompt_source': self.prompt_source,
+                'task_onehot': self.task_onehot}
 
     def to_dict(self):
         return asdict(self)
@@ -182,7 +186,9 @@ def build_policy(config, task_map, initialize_encoder=True):
     transformer = {key: getattr(config, key) for key in (
         'n_layer', 'n_head', 'n_emb', 'n_cond_layers', 'p_drop_emb', 'p_drop_attn', 'causal_attn', 'time_as_cond')}
     global_cond = config.conditioning == 'global'
-    obs_dim = 25 + len(task_map)
+    if len(task_map) > 1 and not config.task_onehot and config.language_conditioning == 'none':
+        raise ValueError('Several tasks but no task conditioning: enable task_onehot or clip_film language conditioning')
+    obs_dim = 25 + (len(task_map) if config.task_onehot else 0)
     if config.lowdim:
         common.update(obs_dim=obs_dim, action_dim=23, pred_action_steps_only=config.pred_action_steps_only)
         input_dim = 23 + (obs_dim if config.conditioning == 'inpainting' else 0)

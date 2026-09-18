@@ -39,10 +39,14 @@ def resize_rgb(image, image_size):
     return result
 
 
-def condition_state(state, task_ids, task_map):
+def condition_state(state, task_ids, task_map, task_onehot=True):
+    """Validate task ids against the checkpoint task map; append their one-hot to the 25-D state unless
+    `task_onehot` is False (the ids are still required and rejected when unknown)."""
     ids = np.asarray(task_ids)
     if ids.dtype.kind not in 'iu' or not np.isin(ids, list(task_map)).all():
         raise ValueError(f'Unknown or noninteger task_id; known ids: {sorted(task_map)}')
+    if not task_onehot:
+        return np.asarray(state, dtype=np.float32)
     positions = {task: i for i, task in enumerate(sorted(task_map))}
     onehot = np.eye(len(task_map), dtype=np.float32)[
         np.asarray([positions[int(task)] for task in ids.reshape(-1)]).reshape(ids.shape)]

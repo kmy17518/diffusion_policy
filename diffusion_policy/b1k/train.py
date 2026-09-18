@@ -22,6 +22,7 @@ from diffusion_policy.b1k.dataset import B1KLeRobotDataset, images_to_float
 from diffusion_policy.b1k.model import POLICY_TARGETS, ModelConfig, build_policy, load_checkpoint
 from diffusion_policy.b1k.robot import CAMERAS
 from diffusion_policy.common.pytorch_util import dict_apply
+from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 
 
@@ -270,7 +271,7 @@ def sync_batchnorm_buffers(policy, averaged_policy):
                 getattr(averaged_module, name).copy_(buffer)
 
 
-def save_checkpoint(output, policy, ema, optimizer, config, dataset, step, args):
+def save_checkpoint(output, policy, ema, optimizer, lr_scheduler, config, dataset, step, args):
     checkpoint = {
         'format': 'diffusion_policy_b1k_v1', 'checkpoint_type': 'full',
         'config': config.to_dict(), 'task_map': dataset.task_map,
@@ -281,7 +282,11 @@ def save_checkpoint(output, policy, ema, optimizer, config, dataset, step, args)
         'training': {'seed': args.seed, 'batch_size': args.batch_size,
                      'learning_rate': args.learning_rate, 'weight_decay': args.weight_decay,
                      'optimizer': args.optimizer, 'betas': tuple(args.betas),
-                     'obs_encoder_weight_decay': args.obs_encoder_weight_decay},
+                     'obs_encoder_weight_decay': args.obs_encoder_weight_decay,
+                     'lr_scheduler': args.lr_scheduler, 'lr_warmup_steps': args.lr_warmup_steps,
+                     'lr_schedule_steps': args.lr_schedule_steps, 'ema_power': args.ema_power,
+                     'grad_clip': args.grad_clip},
+        'lr_scheduler': lr_scheduler.state_dict(),
         'selection': {'task_names': list(dataset.task_map.values()),
                       'max_episodes': args.max_episodes,
                       'episode_indices': [row['episode_index'] for row in dataset.episodes]},
@@ -396,6 +401,23 @@ def parser():
     result.add_argument('--optimizer', choices=['adamw', 'upstream'], default='adamw')
     result.add_argument('--obs-encoder-weight-decay', type=float, default=1e-6)
     result.add_argument('--betas', type=float, nargs=2, default=[0.9, 0.999])
+    result.add_argument('--lr-scheduler', choices=['constant', 'cosine'], default='constant',
+                        help="upstream Diffusion Policy schedule: 'cosine' = linear warmup then cosine decay to 0 "
+                             'over --lr-schedule-steps optimizer steps (stepped after every optimizer step)')
+    result.add_argument('--lr-warmup-steps', type=int, default=0)
+    result.add_argument('--lr-schedule-steps', type=int,
+                        help='Length of the cosine schedule in optimizer steps (default: --max-steps). Fixed at '
+                             'the first launch and restored on resume, so a later --max-steps change does not '
+                             'reshape the schedule')
+    result.add_argument('--ema-power', type=float, default=2 / 3,
+                        help='EMAModel decay exponent: decay = 1 - (1 + step)^-power, clipped to 0.9999 '
+                             '(upstream default 2/3; the RoboCasa recipe uses 0.75)')
+    result.add_argument('--grad-clip', type=float, default=1.0,
+                        help='Gradient-norm clipping threshold; 0 disables clipping (upstream trains unclipped). '
+                             'Non-finite gradients are rejected either way')
+    result.add_argument('--task-onehot', action=argparse.BooleanOptionalAction, default=False,
+                        help='Append the one-hot task id to the 25-D state (the v1 behavior). Off by default: '
+                             'with several tasks the policy then needs --language-conditioning clip_film')
     result.add_argument('--save-every', type=int, default=5000)
     result.add_argument('--save-first-step', action='store_true')
     result.add_argument('--save-total-limit', type=int, default=0, help='Retained local full checkpoints; 0 keeps all')
@@ -453,6 +475,12 @@ def main(argv=None):
                          'workers, retention and export interval nonnegative')
     if args.loader_batch_size is not None and args.loader_batch_size < 1:
         raise ValueError('--loader-batch-size must be positive')
+    if (args.lr_warmup_steps < 0 or args.grad_clip < 0 or not args.ema_power > 0 or
+            (args.lr_schedule_steps is not None and args.lr_schedule_steps < 1)):
+        raise ValueError('--lr-warmup-steps and --grad-clip must be nonnegative, --ema-power positive, '
+                         '--lr-schedule-steps positive')
+    if args.lr_scheduler == 'cosine' and args.lr_warmup_steps >= (args.lr_schedule_steps or args.max_steps):
+        raise ValueError('--lr-warmup-steps must be smaller than the cosine schedule length')
     if args.learning_rate <= 0 or min(args.weight_decay, args.obs_encoder_weight_decay) < 0:
         raise ValueError('Learning rate must be positive and weight decay nonnegative')
     if not all(0 <= beta < 1 for beta in args.betas):
@@ -480,8 +508,11 @@ def run_training(args, device, output):
             args.task_names = checkpoint['selection']['task_names']
         if args.max_episodes is None:
             args.max_episodes = checkpoint['selection']['max_episodes']
-        for key, value in {'optimizer': 'adamw', 'betas': (0.9, 0.999),
-                           'obs_encoder_weight_decay': 1e-6, **checkpoint['training']}.items():
+        for key, value in {'optimizer': 'adamw', 'betas': (0.9, 0.999), 'obs_encoder_weight_decay': 1e-6,
+                           # Checkpoints predating these options trained with a constant learning rate,
+                           # EMA power 2/3 and gradient clipping at 1.0.
+                           'lr_scheduler': 'constant', 'lr_warmup_steps': 0, 'lr_schedule_steps': None,
+                           'ema_power': 2 / 3, 'grad_clip': 1.0, **checkpoint['training']}.items():
             setattr(args, key, value)
     else:
         values = {key: getattr(args, key) for key in ModelConfig.__dataclass_fields__ if hasattr(args, key)}
@@ -539,13 +570,21 @@ def run_training(args, device, output):
         if config.freeze_encoder:
             policy.obs_encoder.eval().requires_grad_(False)
         policy.normalizer.requires_grad_(False)
-        ema = EMAModel(copy.deepcopy(policy))
+        ema = EMAModel(copy.deepcopy(policy), power=args.ema_power)
         ema_updater = EMAUpdater(ema, policy) if args.multi_tensor_ema else None
         optimizer = build_optimizer(policy, args)
+        if args.lr_schedule_steps is None:
+            args.lr_schedule_steps = args.max_steps
+        # Upstream Diffusion Policy's schedule (diffusers' get_scheduler copy): constant, or linear warmup then
+        # cosine decay to zero over lr_schedule_steps; stepped once per optimizer step.
+        lr_scheduler = get_scheduler(args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps,
+                                     num_training_steps=args.lr_schedule_steps)
         step = 0
         if checkpoint:
             ema.averaged_model.load_state_dict(checkpoint['ema_model'])
             ema.optimization_step = checkpoint['ema_step']
+            if 'lr_scheduler' in checkpoint:
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             step = checkpoint['step']
             torch.set_rng_state(checkpoint['rng']['torch'])
@@ -592,8 +631,12 @@ def run_training(args, device, output):
                 # Checked after backward so the CPU can enqueue it without a device sync in between.
                 if not torch.isfinite(loss):
                     raise RuntimeError(f'Non-finite loss at step {step}')
-                grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0, error_if_nonfinite=True)
+                # max_norm=inf leaves the gradients untouched but still computes the norm and rejects non-finite ones.
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), args.grad_clip if args.grad_clip > 0 else float('inf'), error_if_nonfinite=True)
+                learning_rate = optimizer.param_groups[0]['lr']
                 optimizer.step()
+                lr_scheduler.step()
                 if ema_updater is not None:
                     ema_updater.step()
                 else:
@@ -610,14 +653,14 @@ def run_training(args, device, output):
                     path = export_checkpoint(output, ema, config, dataset.task_map, step, dataset.language)
                     print(f'Evaluation export: {path}', flush=True)
                 if step % args.save_every == 0 or step == args.max_steps or (args.save_first_step and step == 1):
-                    path = save_checkpoint(output, policy, ema, optimizer, config, dataset, step, args)
+                    path = save_checkpoint(output, policy, ema, optimizer, lr_scheduler, config, dataset, step, args)
                     print(f'Checkpoint: {path}', flush=True)
                 record = {'step': step, 'loss': loss_value, 'grad_norm': grad_value,
                           'elapsed_s': time.monotonic() - start, 'data_wait_s': data_wait_s,
                           'compute_s': compute_s, 'step_s': data_wait_s + compute_s,
                           'checkpoint_s': time.monotonic() - checkpoint_start,
                           'samples_per_s': args.batch_size / (data_wait_s + compute_s),
-                          'learning_rate': optimizer.param_groups[0]['lr'], **gpu_memory_metrics(device)}
+                          'learning_rate': learning_rate, **gpu_memory_metrics(device)}
                 print(json.dumps(record), flush=True)
                 log.write(json.dumps(record) + '\n')
                 log.flush()
