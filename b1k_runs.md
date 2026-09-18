@@ -1,6 +1,6 @@
 # Transformer Diffusion Policy radio run — 2026-09-16
 
-## Task-name CLIP/FiLM smoke run on the optimized trainer — 2026-09-17 (branch `diffusion_policy_lang_goal`)
+## Task-name CLIP/FiLM smoke run on the optimized trainer — 2026-09-17 (branch `lang_optimized`; the RoboCasa365-configuration work continues on `lang_optimized_robocasa365`)
 
 After merging the language branch into the throughput work, the radio recipe was launched with `--language-conditioning clip_film --prompt-source task_name` (prompt = the literal `turning_on_radio`), physical batch **8,960**, frame cache, bf16 autocast, TF32, `torch.compile default`, math attention — i.e. the optimized recipe below plus language:
 
@@ -49,7 +49,7 @@ tmux -L b1k-act-dp new-session -d -s dp-radio-robocasa365-train \
 ```
 
 - Run directory `outputs/turning-on-radio-transformer12x512-robocasa365-clipfilm-taskdescription-ga4-bs8960-5k-20260918/`, log `/tmp/dev/logs/dp-radio-5k-robocasa365-clipfilm-taskdescription-ga4-bs8960-20260918.log`, W&B `dpradio16-robocasa365-clipfilm-taskdescription-ga4-bs8960-20260918`, GPU 0, cores 90-119, trainer commit `aec3ae1`. The launch completed the 256 px frame cache (`/tmp/dev/datasets/2026-challenge-demos-frame-cache-256`, 237 GB, verified).
-- First 48 steps: **3.55 s/step** (compute-bound, 2 ms data wait, 2.5k samples/s), **143.5 GiB** peak; losses 1.2041 / 1.2040 / 1.2057 / 1.2045 / 1.2022 with the learning rate still in warmup (4.7e-6 at step 48). Expected end after ~4.9 h with `step-00005000.pt`.
+- **Completed**: 5,000 steps in 5.0 h at **3.56 s/step** (compute-bound, 2 ms data wait, 2.5k samples/s), **143.5 GiB** peak, exit 0, checkpoints at steps 1 / 2,500 / 5,000. Mean loss over steps 1001-2000 / 2001-3000 / 3001-4000 / 4001-5000: **0.0881 / 0.0700 / 0.0616 / 0.0562**, loss 0.0543 at step 5,000, versus 0.0707 / 0.0601 / 0.0544 / 0.0504 (0.0484 at 5,000) for the recorded batch-8,960 runs of the previous configuration (86 px crops, horizon 16, one-hot, constant 1e-4, task-name prompt). The learning rate reached 1e-4 at step 1,000 (linear warmup) and was still 9.996e-5 at step 5,000, so this segment is warmup plus an effectively constant 1e-4; the loss gap is not attributable to the schedule tail. Denoising MSE is per action element and therefore comparable across horizons, but the two configurations differ in image resolution, horizon, condition encoder, one-hot, optimizer betas/decay and prompt, so this is a configuration-level comparison, not an ablation.
 
 ## Task-name CLIP/FiLM run
 
