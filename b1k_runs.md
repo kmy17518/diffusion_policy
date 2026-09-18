@@ -15,7 +15,27 @@ tmux -L b1k-act-dp new-session -d -s dp-radio-lang-goal-train \
 - First 134 steps: **0.671 s/step** (compute 0.669, data wait 1.4 ms; 13.4k samples/s) versus 0.60 s/step unconditioned; peak allocated **128.6 GiB** versus 157 GiB unconditioned and 189 GiB for the FP32 eager language run. Step 1 (compilation + first batch) took 171 s.
 - Losses: steps 1-5 **1.2110 / 1.3594 / 1.1107 / 0.9696 / 0.9393** (unconditioned optimized run: 1.1988 / 1.2759 / 1.0615 / 0.9384 / 0.9092); mean over steps 6-60 **0.3908** versus 0.3752; all finite, max clipped gradient norm 1.69. The step-1 full checkpoint carries the `language` cache (`openai/clip-vit-large-patch14` @ `32bd6428…`, prompt `turning_on_radio`, `[1, 768]`) and 48 FiLM tensors.
 - Controlled A/B at batch 1,024, 150 steps, same seed, same flags (`/tmp/dev/audits/dp-lang-goal-20260917/ab-bs1024-{none,clipfilm-taskname}/train.jsonl`): none **0.0808 s/step**, step-1 loss 1.1985, mean loss steps 101-150 0.1629; clip_film/task_name **0.0942 s/step**, 1.2114, 0.1739. Peak memory 19.3 vs 16.2 GiB.
-- This is a throughput/loss smoke run launched as a full 300k-step recipe; no uploader was started. Stop it with `tmux -L b1k-act-dp kill-session -t dp-radio-lang-goal-train` if it is not meant to continue.
+- This is a throughput/loss smoke run launched as a full 300k-step recipe; no uploader was started. **Stopped on request at step 5,786** (SIGINT, exit 130; latest resumable checkpoint step 5,000) to free GPU 0 for the recomputation comparison below.
+
+### Recomputation off, and identity FiLM initialization — 2026-09-18
+
+Two follow-up runs, same recipe and `RUN_TAG`, both launched with `FILM_RECOMPUTE=off` (`--no-film-recompute`: the FiLM residual blocks store their activations instead of recomputing them in backward; exact, see `b1k.md`), one with the default random FiLM initialization on GPU 0 (cores 90-119) and one with `FILM_INIT=identity` (`--film-init identity`, FiLM projections zeroed so every conditioned block starts as the identity) on GPU 2 (cores 60-89):
+
+```bash
+source /tmp/dev/env.sh
+tmux -L b1k-act-dp new-session -d -s dp-radio-lang-goal-norecompute-train \
+  'LANGUAGE_CONDITIONING=clip_film PROMPT_SOURCE=task_name FILM_RECOMPUTE=off RUN_TAG=lang-goal-20260917 \
+   bash /tmp/dev/baselines/diffusion_policy_lang_goal/scripts/b1k/run_radio_300k.sh'
+tmux -L b1k-act-dp new-session -d -s dp-radio-lang-goal-identity-train \
+  'LANGUAGE_CONDITIONING=clip_film PROMPT_SOURCE=task_name FILM_RECOMPUTE=off FILM_INIT=identity RUN_TAG=lang-goal-20260917 \
+   GPU_UUID=GPU-10567c56-9603-b2aa-1ce1-63234ee50192 CORES=60-89 \
+   bash /tmp/dev/baselines/diffusion_policy_lang_goal/scripts/b1k/run_radio_300k.sh'
+# both are stopped by request once train.jsonl records step 5,000 (after that step's checkpoint):
+tmux -L b1k-act-dp new-session -d -s dp-stop-at-5k '/tmp/dev/scripts/dp-stop-at-step.sh 5000 <run-dir-A> <run-dir-B>'
+```
+
+- Run directories `outputs/turning-on-radio-transformer12x512-clipfilm-taskname-norecompute-bs8960-300k-lang-goal-20260917/` and `...-clipfilm-taskname-identity-norecompute-bs8960-300k-lang-goal-20260917/`; logs and W&B ids carry the same `clipfilm-taskname[-identity]-norecompute-bs8960-lang-goal-20260917` identities; trainer commits `5f3ebc0` and `2d1b609`.
+- Early measurements (first 847 / 101 steps): both **0.59 s/step** — the unconditioned recipe's step time — versus 0.67 with recomputation, at **171.8 GiB** peak versus 128.6. Random-init losses match the recomputation-on run to four decimals (1.2110 / 1.3594 / 1.1107 / 0.9695 / 0.9393; mean 6-60 0.3908); identity init starts identically at step 1 (1.2110) and differs from step 2 (1.3586 / 1.1102 / 0.9694 / 0.9393; mean 6-60 0.3907). Final 5,000-step numbers are in the runs' `train.jsonl`, not recorded here.
 
 ## Task-name CLIP/FiLM run
 
