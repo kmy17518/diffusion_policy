@@ -17,6 +17,9 @@
 # see b1k.md "Optional CLIP language + FiLM") with PROMPT_SOURCE (default task_name, the raw
 # snake_case task id; or task_description). Language runs get "clipfilm-<source>-" in their run
 # directory, log, exit file and W&B identities, so they never resume an unconditioned run.
+# FILM_RECOMPUTE (default on; "off" passes --no-film-recompute so the FiLM ResNet blocks store their
+# activations instead of recomputing them in backward: same math, ~5% faster steps, more memory;
+# adds "norecompute-" to the identities so the two variants stay separate runs).
 #
 # Runs from the checkout that contains this script (main clone or any git worktree), using that
 # checkout's .venv and writing its run directory under that checkout's outputs/.
@@ -44,6 +47,18 @@ case "$LANGUAGE_CONDITIONING/$PROMPT_SOURCE" in
         LANG_TAG="clipfilm-${PROMPT_SOURCE//_/}-"
         lang_args=(--language-conditioning clip_film --prompt-source "$PROMPT_SOURCE") ;;
     *) printf 'LANGUAGE_CONDITIONING must be none or clip_film; PROMPT_SOURCE task_name or task_description (clip_film only)\n' >&2
+       exit 1 ;;
+esac
+FILM_RECOMPUTE=${FILM_RECOMPUTE:-on}
+case "$FILM_RECOMPUTE" in
+    on) ;;
+    off) if [[ "$LANGUAGE_CONDITIONING" != clip_film ]]; then
+             printf 'FILM_RECOMPUTE=off requires LANGUAGE_CONDITIONING=clip_film\n' >&2
+             exit 1
+         fi
+         LANG_TAG="${LANG_TAG}norecompute-"
+         lang_args+=(--no-film-recompute) ;;
+    *) printf 'FILM_RECOMPUTE must be on or off\n' >&2
        exit 1 ;;
 esac
 RUN=outputs/turning-on-radio-transformer12x512-${LANG_TAG}bs${BATCH_SIZE}-300k-${RUN_TAG}

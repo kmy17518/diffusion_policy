@@ -428,6 +428,11 @@ def parser():
                         help='EMA update through multi-tensor kernels (same arithmetic as EMAModel.step)')
     result.add_argument('--cudnn-benchmark', action=argparse.BooleanOptionalAction, default=True,
                         help='Let cuDNN time convolution algorithms once for the fixed batch shapes')
+    result.add_argument('--film-recompute', action=argparse.BooleanOptionalAction, default=True,
+                        help='clip_film only: recompute the FiLM ResNet blocks during backward '
+                             '(torch.utils.checkpoint) instead of storing their activations. Same forward '
+                             'values and gradients; trades about a third of the language step-time overhead '
+                             'for activation memory when disabled')
     result.add_argument('--max-episodes', type=int, help='Explicit small-data smoke/debug subset')
     return result
 
@@ -513,6 +518,13 @@ def run_training(args, device, output):
         else:
             print('Computing exact selected-frame limits, streaming parquet once per file (no video).', flush=True)
             policy.set_normalizer(dataset.get_normalizer())
+        if not args.film_recompute:
+            # Runtime choice, not model configuration: no parameters or state_dict keys depend on it, so a
+            # checkpoint trained either way resumes either way.
+            from diffusion_policy.model.vision.clip_film import ResNet18FiLM
+            for module in policy.modules():
+                if isinstance(module, ResNet18FiLM):
+                    module.checkpoint_blocks = False
         policy.to(args.device).train()
         if config.freeze_encoder:
             policy.obs_encoder.eval().requires_grad_(False)

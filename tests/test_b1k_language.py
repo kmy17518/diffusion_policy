@@ -302,6 +302,28 @@ def test_language_sensitivity_gradients_and_lowdim_concatenation(root, fake_clip
     dataset.close()
 
 
+def test_film_recompute_flag_is_numerically_identical_and_recorded(root, tmp_path, fake_clip):
+    from diffusion_policy.b1k.variant_matrix import config_flags
+    config = small_config('transformer_hybrid_image')
+    args = ['--dataset-path', str(root), '--device', 'cpu', '--num-workers', '0', '--batch-size', '2',
+            '--cpu-threads', '1', '--export-every', '0', '--max-steps', '2', *config_flags(config)]
+    recomputed, stored = tmp_path / 'recomputed', tmp_path / 'stored'
+    train_main(args + ['--output-dir', str(recomputed)])
+    train_main(args + ['--output-dir', str(stored), '--no-film-recompute'])
+    first, second = load_checkpoint(recomputed), load_checkpoint(stored)
+    for field in ('model', 'ema_model'):
+        assert first[field].keys() == second[field].keys()
+        for key, value in first[field].items():
+            torch.testing.assert_close(value, second[field][key], rtol=0, atol=0)
+    for path, expected in ((recomputed, True), (stored, False)):
+        assert json.loads((path / 'config.json').read_text())['training']['film_recompute'] is expected
+    # The switch is a runtime choice: a checkpoint trained one way resumes the other way.
+    train_main(args[:args.index('--max-steps')] + ['--max-steps', '3', '--output-dir', str(stored),
+                                                    '--resume', str(stored), *config_flags(config)])
+    assert load_checkpoint(stored)['step'] == 3
+    assert parser().parse_args(['--dataset-path', 'unused', '--output-dir', 'unused']).film_recompute is True
+
+
 @pytest.mark.parametrize('variant', ['unet_lowdim', 'transformer_lowdim', 'unet_video'])
 def test_language_rejects_unsupported_variants(variant):
     with pytest.raises(ValueError, match='clip_film supports only'):
