@@ -51,6 +51,20 @@ tmux -L b1k-act-dp new-session -d -s dp-radio-robocasa365-train \
 - Run directory `outputs/turning-on-radio-transformer12x512-robocasa365-clipfilm-taskdescription-ga4-bs8960-5k-20260918/`, log `/tmp/dev/logs/dp-radio-5k-robocasa365-clipfilm-taskdescription-ga4-bs8960-20260918.log`, W&B `dpradio16-robocasa365-clipfilm-taskdescription-ga4-bs8960-20260918`, GPU 0, cores 90-119, trainer commit `aec3ae1`. The launch completed the 256 px frame cache (`/tmp/dev/datasets/2026-challenge-demos-frame-cache-256`, 237 GB, verified).
 - **Completed**: 5,000 steps in 5.0 h at **3.56 s/step** (compute-bound, 2 ms data wait, 2.5k samples/s), **143.5 GiB** peak, exit 0, checkpoints at steps 1 / 2,500 / 5,000. Mean loss over steps 1001-2000 / 2001-3000 / 3001-4000 / 4001-5000: **0.0881 / 0.0700 / 0.0616 / 0.0562**, loss 0.0543 at step 5,000, versus 0.0707 / 0.0601 / 0.0544 / 0.0504 (0.0484 at 5,000) for the recorded batch-8,960 runs of the previous configuration (86 px crops, horizon 16, one-hot, constant 1e-4, task-name prompt). The learning rate reached 1e-4 at step 1,000 (linear warmup) and was still 9.996e-5 at step 5,000, so this segment is warmup plus an effectively constant 1e-4; the loss gap is not attributable to the schedule tail. Denoising MSE is per action element and therefore comparable across horizons, but the two configurations differ in image resolution, horizon, condition encoder, one-hot, optimizer betas/decay and prompt, so this is a configuration-level comparison, not an ablation.
 
+### RoboCasa365 configuration, constant learning rate, recomputation off — 2026-09-18
+
+Same as the run above except the learning-rate schedule (constant 1e-4 without warmup, as in the batch-8,960 runs of the previous configuration; `LR_SCHEDULER=constant`, tagged `constantlr-`) and FiLM recomputation off (the preset's new default: 210 GiB peak):
+
+```bash
+source /tmp/dev/env.sh
+tmux -L b1k-act-dp new-session -d -s dp-radio-robocasa365-constantlr-train \
+  'PRESET=robocasa365 LR_SCHEDULER=constant BATCH_SIZE=8960 GRAD_ACCUMULATION=4 MAX_STEPS=5000 RUN_TAG=20260918 \
+   bash /tmp/dev/baselines/diffusion_policy_lang_goal/scripts/b1k/run_radio_300k.sh'
+```
+
+- Run directory `outputs/turning-on-radio-transformer12x512-robocasa365-constantlr-clipfilm-taskdescription-norecompute-ga4-bs8960-5k-20260918/`, log `/tmp/dev/logs/dp-radio-5k-robocasa365-constantlr-clipfilm-taskdescription-norecompute-ga4-bs8960-20260918.log`, W&B `dpradio16-robocasa365-constantlr-clipfilm-taskdescription-norecompute-ga4-bs8960-20260918`, GPU 0, cores 90-119, trainer commit `c44cbce`.
+- First 32 steps: **2.72 s/step** (compute-bound; 3.55 with recomputation in the run above), 210.2 GiB peak, learning rate 1e-4 from step 1; losses 1.2041 / 1.8442 / 1.1619 / 1.0790 / 1.1056, mean over steps 6-32 0.7344 (the step-2 excursion is the unclipped, un-warmed first update with betas 0.9/0.95; the previous configuration's runs rose to 1.27-1.36 at step 2 with clipping). Expected end after ~3.7 h with `step-00005000.pt`.
+
 ## Task-name CLIP/FiLM run
 
 **Stopped by user on 2026-09-17 at 05:15 UTC.** The trainer stopped after recorded step **3,675**; the latest resumable checkpoint is **step 2,500**. Trainer, uploader, scheduled health reviews and failure watcher are stopped. Checkpoints and upload journals remain intact. The historical launch/monitoring statements below describe the earlier running state; do not restart this run without a new request.
