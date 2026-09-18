@@ -19,7 +19,10 @@
 #                num_epochs x max_train_steps; the released checkpoint is epoch 500 = 250k steps),
 #                EMA power 0.75, no gradient clipping, batch 192, 250k steps; language on by default
 #                with PROMPT_SOURCE task_description. Adds "robocasa365-" to the identities.
-# Overrides: BATCH_SIZE, MAX_STEPS, IMAGE_SIZE / CROP (square pixels), RUN_TAG (default 20260916 = the
+# Overrides: BATCH_SIZE, GRAD_ACCUMULATION (split each optimizer batch into N micro-batches: same
+# seeded samples per step, one optimizer step per BATCH_SIZE samples, 1/N the activation memory; adds
+# "gaN-" to the identities), LR_SCHEDULE_STEPS (robocasa365 preset: length of the cosine schedule,
+# default 500000), MAX_STEPS, IMAGE_SIZE / CROP (square pixels), RUN_TAG (default 20260916 = the
 # original run directory, which is resumed if it holds latest.pt; any other tag names a fresh run with
 # its own log, exit file and W&B run), COMPILE_MODE (default: "reduce-overhead" = CUDA graphs below
 # 4096 samples, where launch overhead dominates; "default" above, where CUDA graphs measured slower),
@@ -75,8 +78,9 @@ case "$PRESET" in
         LANGUAGE_CONDITIONING=${LANGUAGE_CONDITIONING:-clip_film}
         PROMPT_SOURCE=${PROMPT_SOURCE:-task_description}
         model_args=(--horizon 10 --n-cond-layers 4 --no-task-onehot)
+        LR_SCHEDULE_STEPS=${LR_SCHEDULE_STEPS:-500000}
         optim_args=(--learning-rate 1e-4 --optimizer upstream --weight-decay 1e-3 --obs-encoder-weight-decay 1e-6
-                    --betas 0.9 0.95 --lr-scheduler cosine --lr-warmup-steps 1000 --lr-schedule-steps 500000
+                    --betas 0.9 0.95 --lr-scheduler cosine --lr-warmup-steps 1000 --lr-schedule-steps "$LR_SCHEDULE_STEPS"
                     --ema-power 0.75 --grad-clip 0) ;;
     *) printf 'PRESET must be b1k or robocasa365\n' >&2
        exit 1 ;;
@@ -124,7 +128,20 @@ if [[ "$FRAME_CACHE" == none ]]; then
 else
     loader_args=(--num-workers 8 --frame-cache "$FRAME_CACHE")
 fi
-NAME_TAG="${PRESET_TAG}${LANG_TAG}bs${BATCH_SIZE}"
+GRAD_ACCUMULATION=${GRAD_ACCUMULATION:-1}
+if (( GRAD_ACCUMULATION < 1 || BATCH_SIZE % GRAD_ACCUMULATION )); then
+    printf 'GRAD_ACCUMULATION must be positive and divide BATCH_SIZE\n' >&2
+    exit 1
+fi
+if (( GRAD_ACCUMULATION > 1 )); then
+    ACCUM_TAG="ga${GRAD_ACCUMULATION}-"
+    if [[ "$FRAME_CACHE" == none ]]; then
+        loader_args=(--num-workers 24)   # one worker task per micro-batch; 128-sample chunks need not divide it
+    fi
+else
+    ACCUM_TAG=''
+fi
+NAME_TAG="${PRESET_TAG}${LANG_TAG}${ACCUM_TAG}bs${BATCH_SIZE}"
 RUN=outputs/turning-on-radio-transformer12x512-${NAME_TAG}-${STEPS_TAG}-${RUN_TAG}
 # The original large-batch run keeps its log, exit-status and W&B identity; any other preset, batch
 # size, tag or language setting gets its own.
@@ -158,7 +175,7 @@ taskset -c "$CORES" .venv/bin/python -u scripts/b1k/train_b1k.py \
     --n-obs-steps 2 --n-action-steps 8 --image-size "$IMAGE_SIZE" --crop-shape "$CROP" "$CROP" \
     --scheduler ddpm --num-train-timesteps 100 --num-inference-steps 100 \
     "${optim_args[@]}" \
-    --batch-size "$BATCH_SIZE" "${loader_args[@]}" --prefetch-factor 1 \
+    --batch-size "$BATCH_SIZE" --grad-accumulation "$GRAD_ACCUMULATION" "${loader_args[@]}" --prefetch-factor 1 \
     --cpu-threads 2 --worker-cpu-threads 1 --episode-cache-size 200 --device cuda \
     --matmul-precision high --autocast bf16 --compile "$COMPILE_MODE" \
     --save-every 2500 --save-first-step --save-total-limit 3 --export-every 10000 \

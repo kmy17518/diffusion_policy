@@ -1267,3 +1267,34 @@ def test_checkpoints_without_schedule_fields_resume_with_constant_lr_defaults(ro
 def math_isclose(a, b):
     import math
     return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
+
+
+def test_grad_accumulation_keeps_the_step_batch_resumes_exactly_and_is_recorded(root, tmp_path):
+    # The optimizer batch of a step is the same seeded draw whether or not it is delivered in micro-batches.
+    full = [chunk for chunk in StepBatchSampler(1000, 8, 0, 3, 42)]
+    micro = [chunk for chunk in StepBatchSampler(1000, 8, 0, 3, 42, loader_batch_size=2)]
+    assert len(full) == 3 and len(micro) == 12
+    for step in range(3):
+        assert sum(micro[step * 4:(step + 1) * 4], []) == full[step]
+    args = ['--dataset-path', str(root), '--task-names', 'alpha', '--device', 'cpu', '--num-workers', '0',
+            '--batch-size', '4', '--grad-accumulation', '2', '--cpu-threads', '1', *_small_transformer_flags()]
+    resumed, uninterrupted = tmp_path / 'resumed', tmp_path / 'full'
+    train_main(args + ['--output-dir', str(resumed), '--max-steps', '2'])
+    train_main(args[:args.index('--grad-accumulation')] + args[args.index('--grad-accumulation') + 2:]
+               + ['--output-dir', str(resumed), '--max-steps', '3', '--resume', str(resumed)])
+    train_main(args + ['--output-dir', str(uninterrupted), '--max-steps', '3'])
+    a = torch.load(resumed / 'latest.pt', weights_only=True)
+    b = torch.load(uninterrupted / 'latest.pt', weights_only=True)
+    for field in ('model', 'ema_model'):
+        for key, value in a[field].items():
+            torch.testing.assert_close(value, b[field][key], rtol=0, atol=0)
+    assert a['step'] == a['ema_step'] == 3 and a['training']['grad_accumulation'] == 2
+    assert a['training']['batch_size'] == 4
+    rows = [json.loads(line) for line in (uninterrupted / 'train.jsonl').read_text().splitlines()]
+    assert [row['step'] for row in rows] == [1, 2, 3]            # one record per optimizer step, not per micro-batch
+    assert all(abs(row['samples_per_s'] * row['step_s'] - 4) < 1e-6 for row in rows)
+    assert json.loads((uninterrupted / 'config.json').read_text())['training']['grad_accumulation'] == 2
+    with pytest.raises(ValueError, match='divide --batch-size'):
+        train_main(args + ['--output-dir', str(tmp_path / 'bad'), '--max-steps', '1', '--batch-size', '3'])
+    with pytest.raises(ValueError, match='divide the micro-batch'):
+        train_main(args + ['--output-dir', str(tmp_path / 'bad2'), '--max-steps', '1', '--loader-batch-size', '3'])
