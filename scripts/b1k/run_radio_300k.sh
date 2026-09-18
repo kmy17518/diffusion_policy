@@ -17,6 +17,8 @@
 # see b1k.md "Optional CLIP language + FiLM") with PROMPT_SOURCE (default task_name, the raw
 # snake_case task id; or task_description). Language runs get "clipfilm-<source>-" in their run
 # directory, log, exit file and W&B identities, so they never resume an unconditioned run.
+# FILM_INIT (default random; "identity" passes --film-init identity: FiLM projections start at zero so
+# every conditioned block is initially the identity; adds "identity-" to the identities).
 # FILM_RECOMPUTE (default on; "off" passes --no-film-recompute so the FiLM ResNet blocks store their
 # activations instead of recomputing them in backward: same math, ~5% faster steps, more memory;
 # adds "norecompute-" to the identities so the two variants stay separate runs).
@@ -47,6 +49,18 @@ case "$LANGUAGE_CONDITIONING/$PROMPT_SOURCE" in
         LANG_TAG="clipfilm-${PROMPT_SOURCE//_/}-"
         lang_args=(--language-conditioning clip_film --prompt-source "$PROMPT_SOURCE") ;;
     *) printf 'LANGUAGE_CONDITIONING must be none or clip_film; PROMPT_SOURCE task_name or task_description (clip_film only)\n' >&2
+       exit 1 ;;
+esac
+FILM_INIT=${FILM_INIT:-random}
+case "$FILM_INIT" in
+    random) ;;
+    identity) if [[ "$LANGUAGE_CONDITIONING" != clip_film ]]; then
+                  printf 'FILM_INIT=identity requires LANGUAGE_CONDITIONING=clip_film\n' >&2
+                  exit 1
+              fi
+              LANG_TAG="${LANG_TAG}identity-"
+              lang_args+=(--film-init identity) ;;
+    *) printf 'FILM_INIT must be random or identity\n' >&2
        exit 1 ;;
 esac
 FILM_RECOMPUTE=${FILM_RECOMPUTE:-on}

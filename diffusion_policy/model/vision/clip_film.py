@@ -23,6 +23,21 @@ class FiLMLayer(nn.Module):
         return torch.relu((1 + gamma[:, :, None, None]) * x + beta[:, :, None, None])
 
 
+def identity_initialize_film(root):
+    """Zero every FiLM projection under `root` so beta = gamma = 0 and each conditioned block starts as
+    ReLU(x) = x, i.e. the encoder initially computes what the unconditioned ResNet18 would (the
+    "identity FiLM" arm of compare_language_init). The projections still receive gradients from the
+    first step. Returns the number of FiLM layers initialized."""
+    count = 0
+    with torch.no_grad():
+        for module in root.modules():
+            if isinstance(module, FiLMLayer):
+                module.lang_proj.weight.zero_()
+                module.lang_proj.bias.zero_()
+                count += 1
+    return count
+
+
 class FiLMResidualBlock(nn.Module):
     def __init__(self, block):
         super().__init__()

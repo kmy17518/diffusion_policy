@@ -302,6 +302,32 @@ def test_language_sensitivity_gradients_and_lowdim_concatenation(root, fake_clip
     dataset.close()
 
 
+def test_film_init_identity_zeroes_projections_and_is_recorded(root, tmp_path, fake_clip):
+    from dataclasses import replace
+    from diffusion_policy.b1k.variant_matrix import config_flags
+    from diffusion_policy.model.vision.clip_film import identity_initialize_film
+    config = small_config('transformer_hybrid_image')
+    torch.manual_seed(3)
+    policy = build_policy(config, {3: 'alpha'})
+    encoder = policy.obs_encoder.encoders['head']
+    images = torch.rand(2, 3, 56, 56)
+    assert not torch.equal(encoder(images, torch.randn(2, 768)), encoder(images, torch.randn(2, 768)))
+    assert identity_initialize_film(policy) == 8           # one camera, eight residual blocks
+    assert all(not module.lang_proj.weight.any() and not module.lang_proj.bias.any()
+               for module in policy.modules() if isinstance(module, FiLMLayer))
+    # beta = gamma = 0: the encoder no longer depends on the language embedding at all.
+    torch.testing.assert_close(encoder(images, torch.randn(2, 768)), encoder(images, torch.randn(2, 768)), rtol=0, atol=0)
+    args = ['--dataset-path', str(root), '--device', 'cpu', '--num-workers', '0', '--batch-size', '2',
+            '--cpu-threads', '1', '--export-every', '0', '--max-steps', '1']
+    output = tmp_path / 'identity'
+    train_main(args + ['--output-dir', str(output), '--film-init', 'identity', *config_flags(config)])
+    assert json.loads((output / 'config.json').read_text())['training']['film_init'] == 'identity'
+    with pytest.raises(ValueError, match='film-init identity requires'):
+        train_main(args + ['--output-dir', str(tmp_path / 'none'), '--film-init', 'identity',
+                           *config_flags(replace(config, language_conditioning='none'))])
+    assert parser().parse_args(['--dataset-path', 'unused', '--output-dir', 'unused']).film_init == 'random'
+
+
 def test_film_recompute_flag_is_numerically_identical_and_recorded(root, tmp_path, fake_clip):
     from diffusion_policy.b1k.variant_matrix import config_flags
     config = small_config('transformer_hybrid_image')

@@ -428,6 +428,10 @@ def parser():
                         help='EMA update through multi-tensor kernels (same arithmetic as EMAModel.step)')
     result.add_argument('--cudnn-benchmark', action=argparse.BooleanOptionalAction, default=True,
                         help='Let cuDNN time convolution algorithms once for the fixed batch shapes')
+    result.add_argument('--film-init', choices=['random', 'identity'], default='random',
+                        help='clip_film only, fresh runs only (resume keeps checkpoint weights): random keeps '
+                             'nn.Linear initialization of the FiLM projections; identity zeroes them so beta = '
+                             'gamma = 0 and every conditioned block starts as the identity')
     result.add_argument('--film-recompute', action=argparse.BooleanOptionalAction, default=True,
                         help='clip_film only: recompute the FiLM ResNet blocks during backward '
                              '(torch.utils.checkpoint) instead of storing their activations. Same forward '
@@ -518,6 +522,12 @@ def run_training(args, device, output):
         else:
             print('Computing exact selected-frame limits, streaming parquet once per file (no video).', flush=True)
             policy.set_normalizer(dataset.get_normalizer())
+        if args.film_init == 'identity':
+            if config.language_conditioning != 'clip_film':
+                raise ValueError('--film-init identity requires --language-conditioning clip_film')
+            if checkpoint is None:
+                from diffusion_policy.model.vision.clip_film import identity_initialize_film
+                print(f'Identity FiLM initialization: zeroed {identity_initialize_film(policy)} projections', flush=True)
         if not args.film_recompute:
             # Runtime choice, not model configuration: no parameters or state_dict keys depend on it, so a
             # checkpoint trained either way resumes either way.
