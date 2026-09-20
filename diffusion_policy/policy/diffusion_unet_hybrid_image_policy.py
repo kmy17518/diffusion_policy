@@ -37,9 +37,23 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             obs_encoder_group_norm=False,
             eval_fixed_crop=False,
             obs_encoder=None,
+            goal_keys=(),
+            goal_fusion='none',
             # parameters passed to step
             **kwargs):
+        """
+        goal_keys / goal_fusion (goal-image conditioning, needs an `obs_encoder` built with the same goal settings):
+        `early` pairs each goal with its camera at the encoder stem (global condition unchanged); `late` encodes the
+        goal once per sample (`obs_encoder.encode_goals`) and appends it to the global condition vector
+        `c = concat(c_obs, goal_embedding)`, widening the U-Net's condition projections accordingly.
+        """
         super().__init__()
+        if goal_fusion not in ('none', 'early', 'late'):
+            raise ValueError(f'Unsupported goal_fusion {goal_fusion!r}')
+        if goal_fusion != 'none' and (obs_encoder is None or not obs_as_global_cond):
+            raise ValueError('Goal-image conditioning needs a goal-aware obs_encoder and global observation conditioning')
+        self.goal_keys = tuple(goal_keys) if goal_fusion != 'none' else ()
+        self.goal_fusion = goal_fusion
 
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
@@ -135,6 +149,8 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         if obs_as_global_cond:
             input_dim = action_dim
             global_cond_dim = obs_feature_dim * n_obs_steps
+            if goal_fusion == 'late':
+                global_cond_dim += obs_encoder.goal_feature_dim
 
         model = ConditionalUnet1D(
             input_dim=input_dim,
@@ -173,6 +189,30 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         print("Diffusion params: %e" % sum(p.numel() for p in self.model.parameters()))
         print("Vision params: %e" % sum(p.numel() for p in self.obs_encoder.parameters()))
     
+    # ========= goal-image conditioning helpers ============
+    def split_goals(self, nobs):
+        """Pop the goal images ((B, 3, H, W), no history axis) out of the normalized observation dict."""
+        goals = {key: nobs.pop(key) for key in self.goal_keys if key in nobs}
+        if len(goals) != len(self.goal_keys):
+            raise ValueError(f'Goal-conditioned policy needs {list(self.goal_keys)} in the observation')
+        for key, value in goals.items():
+            if value.dim() != 4:
+                raise ValueError(f'{key} must be (B, 3, H, W): one goal image per sample, no observation-history axis')
+        return goals
+
+    def encode_observations(self, nobs, goals, To):
+        """(B*To, Do) observation features and, for late fusion, (B, Dg) goal features (once per sample)."""
+        this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
+        if self.goal_fusion == 'early':
+            for key, value in goals.items():
+                this_nobs[key] = value.unsqueeze(1).expand(-1, To, *value.shape[1:]).reshape(-1, *value.shape[1:])
+        features = self.obs_encoder(this_nobs)
+        goal_features = None
+        if self.goal_fusion == 'late':
+            last = {key: value[:, To - 1] for key, value in nobs.items() if key in self.obs_encoder.goal_pairs.values()}
+            goal_features = self.obs_encoder.encode_goals({**last, **goals})
+        return features, goal_features
+
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, condition_mask,
@@ -237,11 +277,13 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         local_cond = None
         global_cond = None
         if self.obs_as_global_cond:
-            # condition through global feature
-            this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            # condition through global feature (plus the goal feature for late fusion)
+            goals = self.split_goals(nobs) if self.goal_keys else {}
+            nobs_features, goal_features = self.encode_observations(nobs, goals, To)
             # reshape back to B, Do
             global_cond = nobs_features.reshape(B, -1)
+            if goal_features is not None:
+                global_cond = torch.cat([global_cond, goal_features], dim=-1)
             # empty data for action
             cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
@@ -297,12 +339,12 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         trajectory = nactions
         cond_data = trajectory
         if self.obs_as_global_cond:
-            # reshape B, T, ... to B*T
-            this_nobs = dict_apply(nobs, 
-                lambda x: x[:,:self.n_obs_steps,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, Do
+            goals = self.split_goals(nobs) if self.goal_keys else {}
+            nobs_features, goal_features = self.encode_observations(nobs, goals, self.n_obs_steps)
+            # reshape back to B, Do (plus the goal feature for late fusion)
             global_cond = nobs_features.reshape(batch_size, -1)
+            if goal_features is not None:
+                global_cond = torch.cat([global_cond, goal_features], dim=-1)
         else:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))

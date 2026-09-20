@@ -44,9 +44,27 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             obs_as_cond=True,
             pred_action_steps_only=False,
             obs_encoder=None,
+            goal_keys=(),
+            goal_fusion='none',
             # parameters passed to step
             **kwargs):
+        """
+        goal_keys / goal_fusion (goal-image conditioning, needs an `obs_encoder` built with the same goal settings):
+        `goal_keys` are observation keys holding one (B, 3, H, W) goal image per sample (no history axis). `early`
+        pairs each goal with its camera at the encoder stem (repeated over the observation steps; encoder output
+        unchanged). `late` encodes the goal once per sample (`obs_encoder.encode_goals`, matched crop with the
+        current image of the last observation step) and feeds it to the denoiser as an extra condition token
+        (TransformerForDiffusion goal_cond_dim). Goal features are computed outside the denoising loop.
+        """
         super().__init__()
+        if goal_fusion not in ('none', 'early', 'late'):
+            raise ValueError(f'Unsupported goal_fusion {goal_fusion!r}')
+        if goal_fusion != 'none' and obs_encoder is None:
+            raise ValueError('Goal-image conditioning needs an obs_encoder built with the matching goal settings')
+        if goal_fusion != 'none' and not obs_as_cond:
+            raise ValueError('Goal-image conditioning requires observation conditioning (inpainting detaches the encoder)')
+        self.goal_keys = tuple(goal_keys) if goal_fusion != 'none' else ()
+        self.goal_fusion = goal_fusion
 
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
@@ -140,6 +158,9 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         input_dim = action_dim if obs_as_cond else (obs_feature_dim + action_dim)
         output_dim = input_dim
         cond_dim = obs_feature_dim if obs_as_cond else 0
+        goal_cond_dim = obs_encoder.goal_feature_dim if goal_fusion == 'late' else 0
+        if goal_fusion == 'late' and goal_cond_dim <= 0:
+            raise ValueError('Late goal fusion needs an obs_encoder that encodes goals (goal_feature_dim > 0)')
 
         model = TransformerForDiffusion(
             input_dim=input_dim,
@@ -155,7 +176,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             causal_attn=causal_attn,
             time_as_cond=time_as_cond,
             obs_as_cond=obs_as_cond,
-            n_cond_layers=n_cond_layers
+            n_cond_layers=n_cond_layers,
+            goal_cond_dim=goal_cond_dim
         )
 
         self.obs_encoder = obs_encoder
@@ -182,10 +204,35 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
     
+    # ========= goal-image conditioning helpers ============
+    def split_goals(self, nobs):
+        """Pop the goal images ((B, 3, H, W), no history axis) out of the normalized observation dict."""
+        goals = {key: nobs.pop(key) for key in self.goal_keys if key in nobs}
+        if len(goals) != len(self.goal_keys):
+            raise ValueError(f'Goal-conditioned policy needs {list(self.goal_keys)} in the observation')
+        for key, value in goals.items():
+            if value.dim() != 4:
+                raise ValueError(f'{key} must be (B, 3, H, W): one goal image per sample, no observation-history axis')
+        return goals
+
+    def encode_observations(self, nobs, goals, To):
+        """(B*To, Do) observation features and, for late fusion, (B, Dg) goal features (once per sample)."""
+        this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
+        if self.goal_fusion == 'early':
+            # the same goal is paired with every observation step of its camera
+            for key, value in goals.items():
+                this_nobs[key] = value.unsqueeze(1).expand(-1, To, *value.shape[1:]).reshape(-1, *value.shape[1:])
+        features = self.obs_encoder(this_nobs)
+        goal_features = None
+        if self.goal_fusion == 'late':
+            last = {key: value[:, To - 1] for key, value in nobs.items() if key in self.obs_encoder.goal_pairs.values()}
+            goal_features = self.obs_encoder.encode_goals({**last, **goals})
+        return features, goal_features
+
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, condition_mask,
-            cond=None, generator=None,
+            cond=None, generator=None, goal=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
@@ -201,12 +248,13 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
 
+        model_kwargs = {} if goal is None else {'goal': goal}
         for t in scheduler.timesteps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
 
-            # 2. predict model output
-            model_output = model(trajectory, t, cond)
+            # 2. predict model output (goal features are fixed across the denoising loop)
+            model_output = model(trajectory, t, cond, **model_kwargs)
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(
@@ -244,9 +292,10 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         cond = None
         cond_data = None
         cond_mask = None
+        goal_features = None
         if self.obs_as_cond:
-            this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            goals = self.split_goals(nobs) if self.goal_keys else {}
+            nobs_features, goal_features = self.encode_observations(nobs, goals, To)
             # reshape back to B, To, Do
             cond = nobs_features.reshape(B, To, -1)
             shape = (B, T, Da)
@@ -271,6 +320,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             cond_data, 
             cond_mask,
             cond=cond,
+            goal=goal_features,
             **self.kwargs)
         
         # unnormalize prediction
@@ -324,12 +374,11 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
         # handle different ways of passing observation
         cond = None
+        goal_features = None
         trajectory = nactions
         if self.obs_as_cond:
-            # reshape B, T, ... to B*T
-            this_nobs = dict_apply(nobs, 
-                lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            goals = self.split_goals(nobs) if self.goal_keys else {}
+            nobs_features, goal_features = self.encode_observations(nobs, goals, To)
             # reshape back to B, T, Do
             cond = nobs_features.reshape(batch_size, To, -1)
             if self.pred_action_steps_only:
@@ -370,7 +419,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
         
         # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, cond)
+        pred = self.model(noisy_trajectory, timesteps, cond, **({} if goal_features is None else {'goal': goal_features}))
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':

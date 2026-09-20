@@ -13,6 +13,15 @@ CAMERAS = {
                     'robot_r1::robot_r1:right_realsense_link:Camera:0::rgb'),
 }
 PROPRIO_KEY = 'robot_r1::proprio'
+# Goal images (goal-image conditioning): the dataset's dedicated goal streams and the wire keys of goal images in
+# serving requests (`goal::` + the camera's observation key). `goal_key(camera)` names them in observation dicts.
+GOAL_VIDEO_KEYS = {camera: keys[0].replace('observation.rgb.', 'observation.goal_rgb.') for camera, keys in CAMERAS.items()}
+GOAL_OBS_KEYS = {camera: f'goal::{keys[1]}' for camera, keys in CAMERAS.items()}
+
+
+def goal_key(camera):
+    """Observation-dict key of a camera's goal image."""
+    return f'goal_{camera}'
 
 
 def extract_state(state):

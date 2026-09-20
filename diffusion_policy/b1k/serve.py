@@ -14,7 +14,8 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 from diffusion_policy.b1k.model import ModelConfig, load_policy
-from diffusion_policy.b1k.robot import CAMERAS, PROPRIO_KEY, condition_state, extract_state, resize_rgb
+from diffusion_policy.b1k.robot import (CAMERAS, GOAL_OBS_KEYS, PROPRIO_KEY, condition_state, extract_state, goal_key,
+                                        resize_rgb)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -45,11 +46,15 @@ unpackb = functools.partial(msgpack.unpackb, object_hook=unpack_array, strict_ma
 
 
 class B1KPolicySession:
-    def __init__(self, policy, config, task_map, action_horizon=None, task_name=None, language=None):
+    def __init__(self, policy, config, task_map, action_horizon=None, task_name=None, language=None, fixed_goals=None):
         self.policy = policy
         self.model_config = ModelConfig(**config)
         self.config = self.model_config.to_dict()
         self.task_map = task_map
+        # Goal images: per request under `goal::<camera observation key>`, else the fixed images given at server
+        # start (--goal-image CAMERA=PATH), else the request is rejected for goal-conditioned checkpoints.
+        self.goal_views = tuple(self.model_config.goal_views) if self.model_config.goal_fusion != 'none' else ()
+        self.fixed_goals = {view: np.asarray(image) for view, image in (fixed_goals or {}).items() if view in self.goal_views}
         self.language = None
         if self.model_config.language_conditioning == 'clip_film':
             from diffusion_policy.b1k.language import validate_language_cache
@@ -107,6 +112,21 @@ class B1KPolicySession:
                 raise ValueError(f'Camera {camera} batch does not match proprio')
             images = np.stack([resize_rgb(image, self.config['image_size']) for image in images])
             current[camera] = np.moveaxis(images, -1, 1).astype(np.float32) / 255.
+        goals = {}
+        for view in self.goal_views:
+            key = GOAL_OBS_KEYS[view]
+            if key in obs:
+                images = np.asarray(obs[key])
+                if images.ndim == 3:
+                    images = images[None]
+                if images.ndim != 4 or len(images) != batch_size:
+                    raise ValueError(f'Goal image {key} batch does not match proprio')
+            elif view in self.fixed_goals:
+                images = np.broadcast_to(self.fixed_goals[view], (batch_size, *self.fixed_goals[view].shape))
+            else:
+                raise ValueError(f'Goal-conditioned checkpoint needs {key} in the observation (or --goal-image {view}=PATH)')
+            images = np.stack([resize_rgb(image, self.config['image_size']) for image in images])
+            goals[goal_key(view)] = np.moveaxis(images, -1, 1).astype(np.float32) / 255.
         if len(self.histories) != batch_size:
             self.reset()
             self.histories = [deque(maxlen=self.config['n_obs_steps']) for _ in ids]
@@ -118,6 +138,7 @@ class B1KPolicySession:
                 self.actions[slot].clear()
             self.task_ids[slot] = task
             frame = {key: value[slot].copy() for key, value in current.items()}
+            frame['__goals__'] = {key: value[slot].copy() for key, value in goals.items()}
             if not self.histories[slot]:
                 for _ in range(self.config['n_obs_steps'] - 1):
                     self.histories[slot].append(frame)
@@ -127,6 +148,10 @@ class B1KPolicySession:
             inputs = {key: torch.from_numpy(np.stack([
                 np.stack([frame[key] for frame in self.histories[slot]]) for slot in needs_plan
             ])).to(self.policy.device) for key in current}
+            for key in goals:
+                # the newest goal of each slot; one image per sample, no history axis
+                inputs[key] = torch.from_numpy(np.stack([self.histories[slot][-1]['__goals__'][key]
+                                                         for slot in needs_plan])).to(self.policy.device)
             if self.model_config.lowdim:
                 inputs = {'obs': inputs['state']}
             predicted = self.policy.predict_action(inputs)['action'].detach().cpu().numpy()
@@ -145,17 +170,31 @@ def health_check(connection, request):
     return None
 
 
+def load_goal_images(specs):
+    """`--goal-image CAMERA=PATH` values to {camera: uint8 HWC RGB array} (PNG/JPEG via PyAV)."""
+    import av
+    goals = {}
+    for spec in specs or []:
+        camera, _, path = spec.partition('=')
+        if camera not in CAMERAS or not path:
+            raise ValueError(f'--goal-image expects CAMERA=PATH with CAMERA in {list(CAMERAS)}, got {spec!r}')
+        with av.open(path) as container:
+            goals[camera] = next(container.decode(video=0)).to_ndarray(format='rgb24')
+    return goals
+
+
 class WebsocketPolicyServer:
     def __init__(self, policy, checkpoint, host='0.0.0.0', port=8000,
-                 action_horizon=None, task_name=None):
+                 action_horizon=None, task_name=None, fixed_goals=None):
         self.policy, self.checkpoint = policy, checkpoint
         self.host, self.port = host, port
         self.action_horizon, self.task_name = action_horizon, task_name
+        self.fixed_goals = fixed_goals or {}
         self.new_session()
 
     def new_session(self):
         return B1KPolicySession(self.policy, self.checkpoint['config'], self.checkpoint['task_map'],
-                                self.action_horizon, self.task_name, self.checkpoint.get('language'))
+                                self.action_horizon, self.task_name, self.checkpoint.get('language'), self.fixed_goals)
 
     async def handler(self, websocket):
         session = self.new_session()
@@ -165,6 +204,11 @@ class WebsocketPolicyServer:
             'n_obs_steps': session.config['n_obs_steps'],
             'language_conditioning': session.model_config.language_conditioning,
             'prompt_source': session.model_config.prompt_source,
+            'regime': session.model_config.regime, 'task_onehot': session.model_config.task_onehot,
+            'goal_fusion': session.model_config.goal_fusion, 'goal_views': list(session.goal_views),
+            'goal_observation_keys': [GOAL_OBS_KEYS[view] for view in session.goal_views],
+            'goal_source': session.model_config.goal_source if session.goal_views else None,
+            'fixed_goal_views': sorted(session.fixed_goals),
             'task_map': {str(key): value for key, value in session.task_map.items()},
         }))
         try:
@@ -202,12 +246,15 @@ def main(argv=None):
     parser.add_argument('--task-name')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--cpu-threads', type=int, default=4)
+    parser.add_argument('--goal-image', action='append', metavar='CAMERA=PATH',
+                        help='Goal-conditioned checkpoints: fixed goal image (PNG/JPEG, RGB) for a camera view, used '
+                             'when a request carries no goal::<camera key> image; repeat per view')
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     torch.set_num_threads(args.cpu_threads)
     policy, checkpoint = load_policy(args.model_path, args.device)
     server = WebsocketPolicyServer(policy, checkpoint, args.host, args.port,
-                                   args.action_horizon, args.task_name)
+                                   args.action_horizon, args.task_name, load_goal_images(args.goal_image))
     asyncio.run(server.run())
 
 

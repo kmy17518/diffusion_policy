@@ -131,7 +131,8 @@ def config_flags(config):
         elif isinstance(value, bool):
             flags.append(flag if value else '--no-' + key.replace('_', '-'))
         elif isinstance(value, (tuple, list)):
-            flags.extend([flag, *map(str, value)])
+            if value:  # an empty selection (e.g. goal_views without goal fusion) is the flag's default
+                flags.extend([flag, *map(str, value)])
         else:
             flags.extend([flag, str(value)])
     return flags

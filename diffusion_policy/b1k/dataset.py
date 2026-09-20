@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import time
 
 import av
 import numpy as np
@@ -14,7 +15,9 @@ import pyarrow.parquet as pq
 import torch
 
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
-from diffusion_policy.b1k.robot import CAMERAS, condition_state, extract_state, resize_rgb
+from diffusion_policy.b1k.robot import CAMERAS, GOAL_VIDEO_KEYS, condition_state, extract_state, goal_key, resize_rgb
+
+GOAL_SOURCES = ('episode_last', 'goal_key')
 
 
 class EpisodeSequenceIndex:
@@ -144,8 +147,20 @@ class B1KLeRobotDataset(BaseImageDataset):
                  parquet_cache_mb=256, max_episodes=None, observation_mode='image',
                  obs_steps=None, imagenet_norm=False, language_conditioning='none',
                  prompt_source='task_name', task_onehot=True, image_dtype='float32', frame_cache=None,
-                 video_max_open=32):
+                 video_max_open=32, goal_views=(), goal_source='episode_last'):
+        """
+        goal_views / goal_source (goal-image conditioning): for every camera in `goal_views` (a subset of `cameras`)
+        each sample also carries `goal_<camera>`, one (3, S, S) image for the whole episode with no observation-
+        history axis, looked up from a table built once at construction. `episode_last` decodes the episode's last
+        frame of that camera (any LeRobot v3 root); `goal_key` decodes the dataset's static
+        `observation.goal_rgb.<camera>_camera_0` clip.
+        """
         self.root = Path(dataset_path).resolve()
+        self.goal_views = tuple(goal_views or ())
+        if goal_source not in GOAL_SOURCES:
+            raise ValueError(f'goal_source must be one of {GOAL_SOURCES}')
+        self.goal_source = goal_source
+        self.goal_table = None
         self.info = json.loads((self.root / 'meta/info.json').read_text())
         if not self.info.get('codebase_version', '').startswith('v3'):
             raise ValueError('B1K requires native LeRobot v3 metadata')
@@ -177,6 +192,8 @@ class B1KLeRobotDataset(BaseImageDataset):
         if ((observation_mode == 'image' and not self.cameras) or
                 len(set(self.cameras)) != len(self.cameras) or set(self.cameras) - set(CAMERAS)):
             raise ValueError(f'cameras must be unique names from {list(CAMERAS)}')
+        if len(set(self.goal_views)) != len(self.goal_views) or set(self.goal_views) - set(self.cameras):
+            raise ValueError(f'goal_views must be distinct cameras among {list(self.cameras)}')
         if not 1 <= n_obs_steps <= horizon or not 1 <= n_action_steps <= horizon - n_obs_steps + 1:
             raise ValueError('Need 1 <= n_obs_steps and n_action_steps <= horizon - n_obs_steps + 1')
         if image_size < 1 or episode_cache_size < 1 or parquet_cache_mb < 0:
@@ -215,6 +232,14 @@ class B1KLeRobotDataset(BaseImageDataset):
                 key = CAMERAS[camera][0]
                 columns += [f'videos/{key}/{field}' for field in
                             ('chunk_index', 'file_index', 'from_timestamp', 'to_timestamp')]
+            if self.goal_source == 'goal_key':
+                for camera in self.goal_views:
+                    key = GOAL_VIDEO_KEYS[camera]
+                    wanted = [f'videos/{key}/{field}' for field in ('chunk_index', 'file_index', 'from_timestamp', 'to_timestamp')]
+                    if any(column not in schema for column in wanted):
+                        raise ValueError(f'{path}: no metadata for goal stream {key}; goal_source=goal_key needs the '
+                                         'dataset\'s observation.goal_rgb.* streams (use goal_source=episode_last otherwise)')
+                    columns += wanted
             table = file.read(columns=columns)
             if 'task_index' in schema:
                 table = table.filter(pc.is_in(table['task_index'], value_set=pa.array(sorted(selected))))
@@ -236,6 +261,10 @@ class B1KLeRobotDataset(BaseImageDataset):
                 for camera in self.cameras:
                     if not self.video_path(row, camera).is_file():
                         raise FileNotFoundError(f'Selected camera missing: {self.video_path(row, camera)}')
+                if self.goal_source == 'goal_key':
+                    for camera in self.goal_views:
+                        if not self.goal_video_path(row, camera).is_file():
+                            raise FileNotFoundError(f'Goal stream missing: {self.goal_video_path(row, camera)}')
                 self.episodes.append(row)
         self.episodes.sort(key=lambda row: row['episode_index'])
         ids = [row['episode_index'] for row in self.episodes]
@@ -265,6 +294,41 @@ class B1KLeRobotDataset(BaseImageDataset):
             FrameCacheReader(self.frame_cache, self.root, self.image_size).validate(
                 {self.video_path(row, camera) for row in self.episodes for camera in self.cameras})
         self._reset_cache()
+        if self.goal_views:
+            self._build_goal_table()
+
+    def goal_video_path(self, episode, camera):
+        key = GOAL_VIDEO_KEYS[camera]
+        return self.root / self.info['video_path'].format(
+            video_key=key, chunk_index=episode[f'videos/{key}/chunk_index'],
+            file_index=episode[f'videos/{key}/file_index'])
+
+    def _build_goal_table(self):
+        """Decode every episode's goal image once (main process) into uint8 [episodes, views, S, S, 3].
+
+        One stored goal per episode with a batch-time lookup; workers receive the table through pickling. The
+        frames go through the same `resize_rgb` as the cameras (from the frame cache when one is attached and the
+        goal is a camera frame), so the goal path matches the observation path exactly.
+        """
+        started = time.perf_counter()
+        table = np.empty((len(self.episodes), len(self.goal_views), self.image_size, self.image_size, 3), dtype=np.uint8)
+        reader = VideoReader(self.image_size, max_open=self.video_max_open) if self.goal_source == 'goal_key' else self._video
+        for position, episode in enumerate(self.episodes):
+            for view, camera in enumerate(self.goal_views):
+                if self.goal_source == 'episode_last':
+                    key = CAMERAS[camera][0]
+                    timestamp = float(self._read_episode(episode)['timestamp'][-1]) + episode[f'videos/{key}/from_timestamp']
+                    table[position, view] = reader.read(self.video_path(episode, camera), [timestamp])[0]
+                else:
+                    key = GOAL_VIDEO_KEYS[camera]
+                    table[position, view] = reader.read(self.goal_video_path(episode, camera), [episode[f'videos/{key}/from_timestamp']])[0]
+        if reader is not self._video:
+            reader.close()
+        self._episodes.clear()
+        self.goal_table = table
+        print(json.dumps({'goal_table': {'source': self.goal_source, 'episodes': len(self.episodes),
+                                         'views': list(self.goal_views), 'image_size': self.image_size,
+                                         'seconds': round(time.perf_counter() - started, 1)}}), flush=True)
 
     def prepare_language(self, checkpoint_language=None):
         from diffusion_policy.b1k.language import prepare_language
@@ -383,6 +447,12 @@ class B1KLeRobotDataset(BaseImageDataset):
         state = condition_state(data['state'][obs_frames],
                                 np.full(len(obs_frames), episode['task_index']), self.task_map, self.task_onehot)
         obs = {'state': torch.from_numpy(state)}
+        if self.goal_table is not None:
+            for view, camera in enumerate(self.goal_views):
+                # (3, S, S), no history axis; same dtype convention as the cameras (uint8 -> images_to_float on device)
+                goal = np.ascontiguousarray(np.moveaxis(self.goal_table[position, view], -1, 0))
+                obs[goal_key(camera)] = torch.from_numpy(goal) if self.image_dtype == 'uint8' else \
+                    torch.from_numpy(goal.astype(np.float32) / 255.)
         if self.language_conditioning == 'clip_film':
             if self.language is None:
                 raise RuntimeError('Call dataset.prepare_language() before loading clip_film samples')
@@ -441,6 +511,8 @@ class B1KLeRobotDataset(BaseImageDataset):
             return result
         if self.language_conditioning == 'clip_film':
             normalizer['lang_emb'] = SingleFieldLinearNormalizer.create_identity()
+        for camera in self.goal_views:
+            normalizer[goal_key(camera)] = normalizer[camera]  # the same image range mapping as its camera
         if self.imagenet_norm:
             for camera in self.cameras:
                 normalizer[camera] = SingleFieldLinearNormalizer.create_identity()

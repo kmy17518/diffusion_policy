@@ -22,8 +22,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
             causal_attn: bool=False,
             time_as_cond: bool=True,
             obs_as_cond: bool=False,
-            n_cond_layers: int = 0
+            n_cond_layers: int = 0,
+            goal_cond_dim: int = 0
         ) -> None:
+        """
+        goal_cond_dim > 0 (goal-image late fusion): one extra conditioning token per sample, `cond_goal_emb(goal)`,
+        appended after the observation tokens with its own learned position (its role identity). It is a task
+        condition, not an observed timestep, so every action position may attend to it: the time-based
+        `memory_mask` gets a fully visible column for it. Requires obs_as_cond (a condition memory).
+        """
         super().__init__()
 
         # compute number of tokens for main trunk and condition encoder
@@ -39,6 +46,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         if obs_as_cond:
             assert time_as_cond
             T_cond += n_obs_steps
+        self.goal_as_cond = goal_cond_dim > 0
+        if self.goal_as_cond:
+            if not obs_as_cond:
+                raise ValueError('goal_cond_dim requires observation conditioning (a condition memory to extend)')
+            T_cond += 1
 
         # input embedding stem
         self.input_emb = nn.Linear(input_dim, n_emb)
@@ -48,9 +60,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # cond encoder
         self.time_emb = SinusoidalPosEmb(n_emb)
         self.cond_obs_emb = None
+        self.cond_goal_emb = None
         
         if obs_as_cond:
             self.cond_obs_emb = nn.Linear(cond_dim, n_emb)
+        if self.goal_as_cond:
+            self.cond_goal_emb = nn.Linear(goal_cond_dim, n_emb)
 
         self.cond_pos_emb = None
         self.encoder = None
@@ -128,6 +143,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
                     indexing='ij'
                 )
                 mask = t >= (s-1) # add one dimension since time is the first token in cond
+                if self.goal_as_cond:
+                    # the goal token (last condition slot) is visible to every action position
+                    mask[:, -1] = True
                 mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
                 self.register_buffer('memory_mask', mask)
             else:
@@ -270,13 +288,20 @@ class TransformerForDiffusion(ModuleAttrMixin):
     def forward(self, 
         sample: torch.Tensor, 
         timestep: Union[torch.Tensor, float, int], 
-        cond: Optional[torch.Tensor]=None, **kwargs):
+        cond: Optional[torch.Tensor]=None, goal: Optional[torch.Tensor]=None,
+        goal_valid: Optional[torch.Tensor]=None, **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         cond: (B,T',cond_dim)
+        goal: (B,goal_cond_dim) goal features (goal-image late fusion; required iff goal_cond_dim > 0)
+        goal_valid: optional bool (B,); False masks the goal token out of the cross-attention (absent goal)
         output: (B,T,input_dim)
         """
+        if self.goal_as_cond and goal is None:
+            raise ValueError('This denoiser was built with a goal condition; pass goal features')
+        if not self.goal_as_cond and goal is not None:
+            raise ValueError('This denoiser has no goal condition; do not pass goal features')
         # 1. time
         timesteps = timestep
         if not torch.is_tensor(timesteps):
@@ -314,12 +339,23 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 cond_obs_emb = self.cond_obs_emb(cond)
                 # (B,To,n_emb)
                 cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
+            memory_key_padding_mask = None
+            if self.goal_as_cond:
+                # goal token last; its learned position (cond_pos_emb) is its role identity
+                cond_embeddings = torch.cat([cond_embeddings, self.cond_goal_emb(goal).unsqueeze(1)], dim=1)
+                if goal_valid is not None:
+                    memory_key_padding_mask = torch.zeros(cond_embeddings.shape[:2], dtype=torch.bool, device=sample.device)
+                    memory_key_padding_mask[:, -1] = ~goal_valid.to(torch.bool)
             tc = cond_embeddings.shape[1]
             position_embeddings = self.cond_pos_emb[
                 :, :tc, :
             ]  # each position maps to a (learnable) vector
             x = self.drop(cond_embeddings + position_embeddings)
-            x = self.encoder(x)
+            if memory_key_padding_mask is not None and isinstance(self.encoder, nn.TransformerEncoder):
+                # an absent goal must not leak into the observation tokens through the condition encoder either
+                x = self.encoder(x, src_key_padding_mask=memory_key_padding_mask)
+            else:
+                x = self.encoder(x)
             memory = x
             # (B,T_cond,n_emb)
             
@@ -336,6 +372,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 memory=memory,
                 tgt_mask=self.mask[:t, :t] if self.mask is not None else None,
                 memory_mask=self.memory_mask[:t, :tc] if self.memory_mask is not None else None,
+                memory_key_padding_mask=memory_key_padding_mask,
                 # any leading square slice of the causal `self.mask` is itself causal; see encoder_only
                 tgt_is_causal=self.mask is not None
             )

@@ -273,10 +273,43 @@ def sync_batchnorm_buffers(policy, averaged_policy):
                 getattr(averaged_module, name).copy_(buffer)
 
 
+def source_commit():
+    """Git commit of this checkout (None outside a repository); recorded with every run for provenance."""
+    import subprocess
+    try:
+        result = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).resolve().parent,
+                                capture_output=True, text=True, check=False, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def conditioning_record(config, task_map, dataset_root=None, episodes=None):
+    """Resolved conditioning configuration saved with config.json and every checkpoint (plan section 9)."""
+    goal = config.goal_fusion != 'none'
+    return {
+        'regime': config.regime, 'source_commit': source_commit(), 'dataset_root': str(dataset_root) if dataset_root else None,
+        'task_map': task_map, 'episodes': episodes, 'data_split': 'all',
+        'language': {'implementation': config.language_conditioning,
+                     'prompt_source': config.prompt_source if config.language_conditioning != 'none' else None,
+                     'encoder': 'openai/clip-vit-large-patch14' if config.language_conditioning == 'clip_film' else None,
+                     'encoder_trainability': 'frozen_text_encoder_cached' if config.language_conditioning != 'none' else None,
+                     'on_goal_encoder': config.language_on_goal_encoder if goal and config.goal_fusion == 'late' else None},
+        'goal': {'fusion': config.goal_fusion, 'views': list(config.goal_views) if goal else [],
+                 'encoder': config.goal_encoder if goal else None, 'role_embedding': 'condition_position' if goal and config.goal_fusion == 'late' else None,
+                 'source': config.goal_source if goal else None,
+                 'sampling_policy': 'fixed_terminal_frame_per_episode' if goal else None,
+                 'hindsight_probability': 0.0, 'dropout_probability': 0.0},
+        'task_onehot': config.task_onehot, 'denoiser': config.variant,
+        'pretrained_encoder': config.encoder_weights, 'auxiliary_pose_weight': 0.0, 'guidance_scale': 1.0,
+    }
+
+
 def save_checkpoint(output, policy, ema, optimizer, lr_scheduler, config, dataset, step, args):
     checkpoint = {
         'format': 'diffusion_policy_b1k_v1', 'checkpoint_type': 'full',
         'config': config.to_dict(), 'task_map': dataset.task_map,
+        'conditioning': conditioning_record(config, dataset.task_map, dataset.root, len(dataset.episodes)),
         'normalizer': policy.normalizer.state_dict(),
         'model': policy.state_dict(), 'ema_model': ema.averaged_model.state_dict(),
         'ema_step': ema.optimization_step, 'optimizer': optimizer.state_dict(), 'step': step,
@@ -318,7 +351,7 @@ def save_checkpoint(output, policy, ema, optimizer, lr_scheduler, config, datase
 def export_checkpoint(output, ema, config, task_map, step, language=None):
     checkpoint = {
         'format': 'diffusion_policy_b1k_v1', 'checkpoint_type': 'eval',
-        'config': config.to_dict(), 'task_map': task_map,
+        'config': config.to_dict(), 'task_map': task_map, 'conditioning': conditioning_record(config, task_map),
         'normalizer': ema.averaged_model.normalizer.state_dict(),
         'ema_model': ema.averaged_model.state_dict(), 'step': step,
     }
@@ -465,8 +498,54 @@ def parser():
                              '(torch.utils.checkpoint) instead of storing their activations. Same forward '
                              'values and gradients; trades about a third of the language step-time overhead '
                              'for activation memory when disabled')
+    # --- conditioning regime and goal-image conditioning (b1k.md "Goal-image conditioning") ---
+    result.add_argument('--regime', choices=['none', 'language', 'image', 'image_language'], default=None,
+                        action=ExplicitLanguageChoice,
+                        help='Declared conditioning regime: none (N: observation only, no task id), language (L),'
+                             ' image (I) or image_language (LI). Fills defaults (language: clip_film; image: late'
+                             ' head-goal fusion) and rejects disagreeing flags; recorded in the checkpoint')
+    result.add_argument('--goal-fusion', choices=['none', 'early', 'late'], default='none', action=ExplicitLanguageChoice,
+                        help='Goal-image conditioning for the hybrid image policies: early (goal channel-stacked with'
+                             ' its camera before the ResNet stem, zero-initialised goal stem) or late (goal encoded by'
+                             ' the camera encoder into a 64-D feature: an extra condition token for the transformer,'
+                             ' appended to the global condition for the U-Net)')
+    result.add_argument('--goal-views', choices=list(CAMERAS), nargs='+', default=None, action=ExplicitLanguageChoice,
+                        help='Cameras whose goal image is supplied (default with --goal-fusion: head)')
+    result.add_argument('--goal-source', choices=['episode_last', 'goal_key'], default='episode_last',
+                        action=ExplicitLanguageChoice,
+                        help='episode_last: the last frame of the episode\'s camera; goal_key: the dataset\'s'
+                             ' observation.goal_rgb.<camera> stream')
+    result.add_argument('--goal-encoder', choices=['shared_base', 'separate_base'], default='shared_base',
+                        action=ExplicitLanguageChoice,
+                        help='Late fusion: encode the goal with the camera\'s own encoder (default) or a separate copy')
+    result.add_argument('--language-on-goal-encoder', action=argparse.BooleanOptionalAction, default=False,
+                        help='Late fusion with clip_film: also FiLM-modulate the goal pass (default: identity FiLM)')
     result.add_argument('--max-episodes', type=int, help='Explicit small-data smoke/debug subset')
     return result
+
+
+def resolve_regime(args):
+    """Fill the regime's defaults and reject disagreeing flags (fresh runs; ModelConfig.validate re-checks)."""
+    if args.goal_fusion != 'none' and args.goal_views is None:
+        args.goal_views = ['head']
+    if args.goal_fusion == 'none' and args.goal_views:
+        raise ValueError('--goal-views require --goal-fusion early or late')
+    args.goal_views = tuple(args.goal_views or ())
+    if args.regime is None:
+        return
+    wants_language = args.regime in ('language', 'image_language')
+    wants_goal = args.regime in ('image', 'image_language')
+    if wants_language and not getattr(args, 'language_conditioning_explicit', False):
+        args.language_conditioning = 'clip_film'
+    if wants_goal and not getattr(args, 'goal_fusion_explicit', False):
+        args.goal_fusion = 'late'
+        args.goal_views = args.goal_views or ('head',)
+    if wants_language != (args.language_conditioning != 'none'):
+        raise ValueError(f'--regime {args.regime} {"requires" if wants_language else "excludes"} language conditioning')
+    if wants_goal != (args.goal_fusion != 'none'):
+        raise ValueError(f'--regime {args.regime} {"requires" if wants_goal else "excludes"} --goal-fusion early|late')
+    if args.task_onehot:
+        print(f'WARNING: --task-onehot with --regime {args.regime}: the task id enters the state (task-ID experiment)', flush=True)
 
 
 def main(argv=None):
@@ -528,8 +607,9 @@ def run_training(args, device, output):
                            **checkpoint['training']}.items():
             setattr(args, key, value)
     else:
+        resolve_regime(args)
         values = {key: getattr(args, key) for key in ModelConfig.__dataclass_fields__ if hasattr(args, key)}
-        for key in ('cameras', 'down_dims', 'crop_shape', 'resize_shape'):
+        for key in ('cameras', 'down_dims', 'crop_shape', 'resize_shape', 'goal_views'):
             if values[key] is not None:
                 values[key] = tuple(values[key])
         config = ModelConfig(**values, clip_sample=not args.no_clip_sample)
@@ -537,6 +617,13 @@ def run_training(args, device, output):
     args.variant = config.variant
     args.language_conditioning = config.language_conditioning
     args.prompt_source = config.prompt_source
+    for key in ('regime', 'goal_fusion', 'goal_source', 'goal_encoder'):
+        if checkpoint and getattr(args, f'{key}_explicit', False) and getattr(args, key) != getattr(config, key):
+            raise ValueError(f'--{key.replace("_", "-")} conflicts with the resumed checkpoint')
+        setattr(args, key, getattr(config, key))
+    if checkpoint and getattr(args, 'goal_views_explicit', False) and tuple(args.goal_views) != tuple(config.goal_views):
+        raise ValueError('--goal-views conflicts with the resumed checkpoint')
+    args.goal_views = tuple(config.goal_views)
     if args.optimizer == 'upstream' and not config.variant.startswith('transformer_'):
         raise ValueError('--optimizer upstream requires a transformer variant')
     if checkpoint and checkpoint['step'] >= args.max_steps:
@@ -628,7 +715,9 @@ def run_training(args, device, output):
             generator=torch.Generator().manual_seed(args.seed),
             **({'multiprocessing_context': 'spawn', 'prefetch_factor': args.prefetch_factor} if args.num_workers else {}))
         (output / 'config.json').write_text(json.dumps({
-            'model': config.to_dict(), 'tasks': dataset.task_map, 'training': vars(args)}, indent=2, default=str))
+            'model': config.to_dict(), 'tasks': dataset.task_map, 'training': vars(args),
+            'conditioning': conditioning_record(config, dataset.task_map, dataset.root, len(dataset.episodes))},
+            indent=2, default=str))
         if device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats(device)
         with (output / 'train.jsonl').open('a') as log:

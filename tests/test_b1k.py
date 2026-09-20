@@ -749,7 +749,8 @@ def test_longrun_retention_export_and_resume(root, tmp_path, limit, expected):
     full = load_checkpoint(output)
     assert full['checkpoint_type'] == 'full' and full['optimizer']['state']
     evaluation = load_checkpoint(queue / 'eval/step-00000004.pt')
-    assert set(evaluation) == {'format', 'checkpoint_type', 'config', 'task_map', 'normalizer', 'ema_model', 'step'}
+    assert set(evaluation) == {'format', 'checkpoint_type', 'config', 'task_map', 'normalizer', 'ema_model', 'step',
+                               'conditioning'}
     assert evaluation['checkpoint_type'] == 'eval' and evaluation['step'] == 4
     with pytest.raises(ValueError, match='eval-only'):
         train_main(args + ['--max-steps', '6', '--resume', str(queue / 'eval/step-00000004.pt')])

@@ -6,7 +6,8 @@ import importlib
 import torch
 from diffusers import DDIMScheduler, DDPMScheduler
 
-from diffusion_policy.b1k.robot import CAMERAS
+from diffusion_policy.b1k.robot import CAMERAS, goal_key
+from diffusion_policy.b1k.dataset import GOAL_SOURCES
 
 
 POLICY_TARGETS = {
@@ -62,6 +63,16 @@ class ModelConfig:
     # Append the one-hot task id to the 25-D state. True is the v1 behavior and therefore the dataclass
     # default (checkpoints without the field keep it); the trainer CLI defaults to --no-task-onehot.
     task_onehot: bool = True
+    # Conditioning regime declared for the run (none | language | image | image_language; None = not declared) and
+    # goal-image conditioning (b1k.md "Goal-image conditioning"): fusion none | early | late, goal views (camera
+    # names), goal source episode_last | goal_key, goal encoder shared_base | separate_base (late), and whether the
+    # goal pass is also FiLM-modulated by language (late, clip_film).
+    regime: str | None = None
+    goal_fusion: str = 'none'
+    goal_views: tuple = ()
+    goal_source: str = 'episode_last'
+    goal_encoder: str = 'shared_base'
+    language_on_goal_encoder: bool = False
 
     @property
     def lowdim(self):
@@ -78,14 +89,47 @@ class ModelConfig:
                 'observation_mode': 'lowdim' if self.lowdim else 'image',
                 'obs_steps': self.obs_steps, 'imagenet_norm': self.imagenet_norm,
                 'language_conditioning': self.language_conditioning, 'prompt_source': self.prompt_source,
-                'task_onehot': self.task_onehot}
+                'task_onehot': self.task_onehot, 'goal_views': self.goal_views if self.goal_fusion != 'none' else (),
+                'goal_source': self.goal_source}
 
     def to_dict(self):
         return asdict(self)
 
+    @property
+    def goal_keys(self):
+        """Observation keys of the goal images, `goal_<camera>`, in goal_views order (empty without goal fusion)."""
+        return tuple(goal_key(view) for view in self.goal_views) if self.goal_fusion != 'none' else ()
+
     def validate(self):
         if self.variant not in POLICY_TARGETS:
             raise ValueError(f'Unknown diffusion variant {self.variant!r}')
+        if self.regime not in (None, 'none', 'language', 'image', 'image_language'):
+            raise ValueError(f'Unknown regime {self.regime!r}')
+        if self.goal_fusion not in ('none', 'early', 'late') or self.goal_encoder not in ('shared_base', 'separate_base'):
+            raise ValueError('goal_fusion must be none, early or late; goal_encoder shared_base or separate_base')
+        if self.goal_source not in GOAL_SOURCES:
+            raise ValueError(f'goal_source must be one of {GOAL_SOURCES}')
+        if self.goal_fusion != 'none':
+            views = tuple(self.goal_views)
+            if not views or len(set(views)) != len(views) or set(views) - set(self.cameras):
+                raise ValueError('goal_views must be distinct cameras of this policy (goal fusion pairs a goal with its camera)')
+            if self.variant not in ('unet_hybrid_image', 'transformer_hybrid_image'):
+                raise ValueError('Goal-image conditioning is implemented for the hybrid image policies '
+                                 '(unet_hybrid_image, transformer_hybrid_image)')
+            if self.conditioning != 'global':
+                raise ValueError('Goal-image conditioning requires global observation conditioning')
+            if self.goal_fusion == 'early' and self.goal_encoder != 'shared_base':
+                raise ValueError('Early fusion pairs the goal with its camera stem; goal_encoder must be shared_base')
+        elif self.goal_views:
+            raise ValueError('goal_views require goal_fusion early or late')
+        if self.language_on_goal_encoder and (self.language_conditioning == 'none' or self.goal_fusion != 'late'):
+            raise ValueError('language_on_goal_encoder applies to late goal fusion with language conditioning')
+        if self.regime is not None:
+            wants_language, wants_goal = self.regime in ('language', 'image_language'), self.regime in ('image', 'image_language')
+            if wants_language != (self.language_conditioning != 'none'):
+                raise ValueError(f'regime {self.regime} and language_conditioning {self.language_conditioning} disagree')
+            if wants_goal != (self.goal_fusion != 'none'):
+                raise ValueError(f'regime {self.regime} and goal_fusion {self.goal_fusion} disagree')
         if self.language_conditioning not in ('none', 'clip_film'):
             raise ValueError('language_conditioning must be none or clip_film')
         if self.prompt_source not in ('task_name', 'task_description'):
@@ -186,8 +230,11 @@ def build_policy(config, task_map, initialize_encoder=True):
     transformer = {key: getattr(config, key) for key in (
         'n_layer', 'n_head', 'n_emb', 'n_cond_layers', 'p_drop_emb', 'p_drop_attn', 'causal_attn', 'time_as_cond')}
     global_cond = config.conditioning == 'global'
-    if len(task_map) > 1 and not config.task_onehot and config.language_conditioning == 'none':
-        raise ValueError('Several tasks but no task conditioning: enable task_onehot or clip_film language conditioning')
+    if (len(task_map) > 1 and not config.task_onehot and config.language_conditioning == 'none'
+            and config.goal_fusion == 'none' and config.regime != 'none'):
+        # Regime N deliberately trains several tasks with no task signal; anything else must say what conditions it.
+        raise ValueError('Several tasks but no task conditioning: enable task_onehot, language or goal conditioning, '
+                         'or declare --regime none for the observation-only condition')
     obs_dim = 25 + (len(task_map) if config.task_onehot else 0)
     if config.lowdim:
         common.update(obs_dim=obs_dim, action_dim=23, pred_action_steps_only=config.pred_action_steps_only)
@@ -214,6 +261,11 @@ def build_policy(config, task_map, initialize_encoder=True):
     if config.language_conditioning == 'clip_film':
         from diffusion_policy.b1k.language import LANGUAGE_DIM, LANGUAGE_KEY
         shape_meta['obs'][LANGUAGE_KEY] = {'shape': [LANGUAGE_DIM], 'type': 'low_dim'}
+    goal_pairs = {}
+    for view in (config.goal_views if config.goal_fusion != 'none' else ()):
+        # goal images: one per view, no history axis, same size/normalization as the camera they pair with
+        shape_meta['obs'][goal_key(view)] = {'shape': [3, config.image_size, config.image_size], 'type': 'rgb'}
+        goal_pairs[goal_key(view)] = view
     common['shape_meta'] = shape_meta
     if config.variant == 'unet_image':
         from diffusion_policy.common.pytorch_util import replace_submodules
@@ -244,11 +296,18 @@ def build_policy(config, task_map, initialize_encoder=True):
         else:
             policy.obs_encoder.train()
         return policy
-    if config.language_conditioning == 'clip_film':
+    if config.language_conditioning == 'clip_film' or config.goal_fusion != 'none':
+        # Our explicit re-implementation of robomimic's hybrid encoder (same architecture; see clip_film.py and
+        # tests/test_b1k_goal.py for the equivalence check) carries the language FiLM and goal options. The
+        # language-free, goal-free path keeps robomimic's own encoder.
         from diffusion_policy.model.vision.clip_film import FiLMHybridObsEncoder
         common['obs_encoder'] = FiLMHybridObsEncoder(
             shape_meta, crop_shape=config.crop_shape, group_norm=config.obs_encoder_group_norm,
-            eval_fixed_crop=config.eval_fixed_crop)
+            eval_fixed_crop=config.eval_fixed_crop, language=config.language_conditioning == 'clip_film',
+            goal_keys=config.goal_keys, goal_pairs=goal_pairs, goal_fusion=config.goal_fusion,
+            goal_encoder=config.goal_encoder, language_on_goal_encoder=config.language_on_goal_encoder)
+        common['goal_keys'] = config.goal_keys
+        common['goal_fusion'] = config.goal_fusion
     hybrid = dict(crop_shape=config.crop_shape, obs_encoder_group_norm=config.obs_encoder_group_norm,
                   eval_fixed_crop=config.eval_fixed_crop)
     if config.variant == 'unet_hybrid_image':
