@@ -73,9 +73,10 @@ if [[ -n "$(nvidia-smi --id "$CUDA_VISIBLE_DEVICES" --query-compute-apps=pid --f
     printf 'Assigned GPU %s is occupied; refusing to start.\n' "$CUDA_VISIBLE_DEVICES" >&2
     exit 1
 fi
-mkdir -p "$RUN"
-if [[ ! -e "$RUN/trainer_commit.txt" ]]; then
-    { git rev-parse HEAD; git rev-parse --abbrev-ref HEAD; } >"$RUN/trainer_commit.txt"
+mkdir -p outputs
+# The trainer refuses a nonempty fresh run directory, so provenance sits next to it.
+if [[ ! -e "$RUN.trainer_commit.txt" ]]; then
+    { git rev-parse HEAD; git rev-parse --abbrev-ref HEAD; } >"$RUN.trainer_commit.txt"
 fi
 printf '[%s] condition=%s checkout=%s commit=%s gpu=%s cores=%s\n' "$(date -u +%FT%TZ)" "$CONDITION" "$CHECKOUT" \
     "$(git rev-parse --short HEAD)" "$CUDA_VISIBLE_DEVICES" "$CORES"
