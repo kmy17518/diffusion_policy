@@ -45,11 +45,18 @@ unpackb = functools.partial(msgpack.unpackb, object_hook=unpack_array, strict_ma
 
 
 class B1KPolicySession:
-    def __init__(self, policy, config, task_map, action_horizon=None, task_name=None):
+    def __init__(self, policy, config, task_map, action_horizon=None, task_name=None, language=None):
         self.policy = policy
         self.model_config = ModelConfig(**config)
         self.config = self.model_config.to_dict()
         self.task_map = task_map
+        self.language = None
+        if self.model_config.language_conditioning == 'clip_film':
+            from diffusion_policy.b1k.language import validate_language_cache
+            self.language = validate_language_cache(
+                language if language is not None else getattr(policy, 'language', None),
+                task_map, self.model_config.prompt_source)
+        self.language_rows = {index: row for row, index in enumerate(sorted(task_map))}
         self.action_horizon = config['n_action_steps'] if action_horizon is None else action_horizon
         if not 1 <= self.action_horizon <= config['n_action_steps']:
             raise ValueError('--action-horizon must be between 1 and checkpoint n_action_steps')
@@ -88,8 +95,10 @@ class B1KPolicySession:
             raise ValueError('proprio must have shape (61,) or (B,61)')
         batch_size = len(state)
         ids = self._tasks(obs, batch_size)
-        state = condition_state(extract_state(state), np.asarray(ids), self.task_map)
+        state = condition_state(extract_state(state), np.asarray(ids), self.task_map, self.model_config.task_onehot)
         current = {'state': state}
+        if self.language is not None:
+            current['lang_emb'] = self.language['embeddings'][[self.language_rows[index] for index in ids]].numpy()
         for camera in (() if self.model_config.lowdim else self.config['cameras']):
             images = np.asarray(obs[CAMERAS[camera][1]])
             if images.ndim == 3:
@@ -146,7 +155,7 @@ class WebsocketPolicyServer:
 
     def new_session(self):
         return B1KPolicySession(self.policy, self.checkpoint['config'], self.checkpoint['task_map'],
-                                self.action_horizon, self.task_name)
+                                self.action_horizon, self.task_name, self.checkpoint.get('language'))
 
     async def handler(self, websocket):
         session = self.new_session()
@@ -154,6 +163,8 @@ class WebsocketPolicyServer:
             'policy': type(self.policy).__name__, 'variant': session.model_config.variant, 'action_dim': 23,
             'action_horizon': session.action_horizon,
             'n_obs_steps': session.config['n_obs_steps'],
+            'language_conditioning': session.model_config.language_conditioning,
+            'prompt_source': session.model_config.prompt_source,
             'task_map': {str(key): value for key, value in session.task_map.items()},
         }))
         try:

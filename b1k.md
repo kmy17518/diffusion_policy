@@ -1,16 +1,17 @@
 # Native Diffusion Policy for BEHAVIOR-1K
 
-This adapter trains directly on **LeRobot v3 packed parquet + video**. It does not convert the dataset to Zarr/HDF5, use language models, or replace upstream models. The only derived artifact is the optional, byte-for-byte verified resized-frame cache described under [Throughput](#throughput-loader-and-blackwell-gpu); the native video reader remains the default. `--variant` selects the actual upstream diffusion policy class. Five classes are executable; the sixth, video, has genuinely missing upstream encoder source (see the coverage matrix below). The original Hydra entrypoints/configurations remain available.
+This adapter trains directly on **LeRobot v3 packed parquet + video**. It does not convert the dataset to Zarr/HDF5 or replace upstream models. The only derived artifact is the optional, byte-for-byte verified resized-frame cache described under [Throughput](#throughput-loader-and-blackwell-gpu); the native video reader remains the default. Language conditioning is optional ([CLIP + FiLM](#optional-clip-language--film)); the default uses no language model. `--variant` selects the actual upstream diffusion policy class. Five classes are executable; the sixth, video, has genuinely missing upstream encoder source (see the coverage matrix below). The original Hydra entrypoints/configurations remain available.
 
 The backward-compatible default is `unet_image`: upstream `DiffusionUnetImagePolicy`, `MultiImageObsEncoder`, `ConditionalUnet1D`, and DDPM with a shared ResNet18/GroupNorm encoder, no pretrained download, and RGB limits normalization. Old B1K v1 checkpoints without a variant field retain exactly that selection.
 
 ## Environment
 
-Use a project-local environment. On the verified ARM/GB300 host, Python 3.11 avoids the unavailable Python 3.10 `numcodecs` wheel/header combination:
+Use a project-local environment in the checkout you are working in: the main clone or a git worktree of it (for example `/tmp/dev/baselines/diffusion_policy_lang_goal`). Each checkout gets its own `.venv` (gitignored) and its own `outputs/`; `scripts/b1k/run_radio_300k.sh` likewise runs from whichever checkout contains it. The commands on this page run from that checkout, so set `DP_DIR` to it once per shell. On the verified ARM/GB300 host, Python 3.11 avoids the unavailable Python 3.10 `numcodecs` wheel/header combination:
 
 ```bash
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
+export DP_DIR=/tmp/dev/baselines/diffusion_policy   # this checkout; e.g. /tmp/dev/baselines/diffusion_policy_lang_goal for that worktree
+cd "$DP_DIR"
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python torch==2.10.0 torchvision==0.25.0 \
   --index-url https://download.pytorch.org/whl/cu130
@@ -26,17 +27,36 @@ Choose a hardware-appropriate PyTorch index elsewhere. The two hybrid classes re
 
 ```bash
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/train_b1k.py \
   --dataset-path /tmp/dev/datasets/2026-challenge-demos \
   --task-names turning_on_radio \
-  --output-dir /tmp/dev/baselines/diffusion_policy/outputs/radio \
+  --output-dir "$DP_DIR/outputs/radio" \
   --max-steps 100000 --batch-size 64 --num-workers 4 --device cuda
 ```
 
 `--dataset-root` aliases `--dataset-path`. Omit `--task-names` to use all locally present episodes/tasks; multiple names are space-separated. Unknown names and requested tasks without episodes fail explicitly. Noncontiguous/nonzero episode IDs and partial downloads are supported. No missing data is downloaded. Missing selected camera files fail before training. The output must be outside the dataset tree, and an existing nonempty output requires `--resume`.
 
 Defaults: trajectory horizon 16, observation history 2, executed prediction steps 8, images 96×96, all three cameras, U-Net widths 256/512/1024, diffusion embedding 256, cosine beta schedule, 100 training/inference noise steps, epsilon prediction, AdamW learning rate 1e-4. `--scheduler ddim --num-inference-steps 10` chooses DDIM. `--cameras head left_wrist` avoids loading the omitted camera. `--image-size`, `--horizon`, `--n-obs-steps`, `--n-action-steps`, `--down-dims`, and `--diffusion-step-embed-dim` are configurable. Horizon must be divisible by the U-Net downsampling factor. `--max-episodes` explicitly limits data for debugging; it is recorded in the checkpoint and must not eliminate a requested task.
+
+### Optional CLIP language + FiLM
+
+Add `--language-conditioning clip_film --prompt-source task_name` to an image recipe, or use `--prompt-source task_description`. Defaults are **`none`** and **`task_name`**, so old model/checkpoint tensor keys and categorical state conditioning are unchanged. The existing 25-D state plus task one-hot remains present in language mode too.
+
+- `task_name` encodes the **exact raw metadata name**, including underscores and case; it does not replace underscores with spaces. `task_description` joins selected IDs/names to `meta/tasks.jsonl` records with `task_index`, `task_name`, and description in `task`. Duplicate/conflicting task mappings, malformed metadata, and missing/blank selected prompts fail before training. Different tasks may legitimately share description text.
+- The initial run lazily loads frozen, evaluation-mode `CLIPTextModelWithProjection` from **`openai/clip-vit-large-patch14`**, pinned to **`32bd64288804d66eefd0ccbe215aa642df71cc41`**. It stores the **unnormalized 768-D `text_embeds`**, not normalized cosine features. CLIP is used once per selected task at setup on CPU, is never an optimizer parameter, and is not loaded by workers, resume, or serving. `transformers>=4.46,<5` is a versioned optional-runtime dependency in `requirements-b1k.txt`.
+- CLIP has a 77-token context. Short prompts use standard tokenizer/model behavior. Longer prompts are tokenized **without truncation**, split into consecutive chunks of at most **75 content tokens**, wrapped individually with BOS/EOS, padded to 77 with attention masks, encoded, and reduced by an arithmetic mean of projected chunk embeddings. No token is silently dropped; the mean is not L2-normalized. The checkpoint records this scheme as `clip_77_content_chunks_mean_v1`.
+- Each ResNet18 residual block (all eight, for every camera) is followed by a separate `Linear(768, 2*C)` producing **beta then gamma**, and `ReLU((1 + gamma) * x + beta)`. Language is an explicit forward argument, never a mutable global or hook. `lang_emb` is also concatenated alongside visual features and state as identity-normalized low-dimensional input, matching the RoboCasa conditioning path. Hybrid encoders retain independent cameras, ResNet18, 32-keypoint spatial-softmax, the 64-D projection/ReLU, and crop semantics; tests copy upstream weights and check zero-FiLM feature/gradient parity.
+- Supported: `transformer_hybrid_image` global conditioning (including action-only), `unet_hybrid_image`, and `unet_image` (global/inpainting). The 12-layer/512-wide transformer uses the same controls as before. Lowdim/video reject `clip_film`. Transformer-hybrid inpainting rejects it because the upstream branch detaches the encoded trajectory. Frozen vision encoders reject it because FiLM must train. These restrictions apply only to language mode.
+- GroupNorm language encoders automatically use `torch.utils.checkpoint.checkpoint(..., use_reentrant=False)` for each residual-block/FiLM pair during gradient-enabled training. Recomputation retains the **same physical batch and numerics as the surrounding run** (FP32 by default; the opt-in `--autocast bf16` / `--compile` / `--sdpa-backend` settings under [Throughput](#throughput-loader-and-blackwell-gpu) apply to the FiLM encoders too, and the recomputed blocks compile inside the encoder graph), with no gradient accumulation. BatchNorm paths and inference do not recompute blocks, avoiding double running-statistic updates. No-language behavior is untouched.
+- Measured with the optimized recipe (frame cache, bf16, TF32, `torch.compile`, math attention; `/tmp/dev/audits/dp-lang-goal-20260917/` and `b1k_runs.md`): `clip_film` with `task_name` costs **0.094 vs 0.081 s/step at batch 1,024** (+17%) and **0.67 vs 0.60 s/step at batch 8,960** (+12%), with ~1 ms data wait either way; peak memory at 8,960 is **129 GiB vs 157 GiB** unconditioned because the eight FiLM blocks per camera are recomputed rather than stored. Same-seed losses track the unconditioned run 3–7% higher over the first 150 steps (mean over steps 6–60 at 8,960: 0.3908 vs 0.3752), consistent with the FiLM initialization comparison recorded in `b1k_runs.md`; convergence and task success are not established by these runs.
+- `--no-film-recompute` (recipe `FILM_RECOMPUTE=off`) stores the FiLM blocks' activations instead of recomputing them. It is exact — in eager mode the loss and all 470 gradient tensors are bitwise equal either way, and the trainer test checks bitwise model/EMA equality after two steps — and at batch 8,960 it returns the step time to the unconditioned **0.59 s** for **172 GiB** peak (batch 1,024: 0.090 vs 0.094 s, 21 vs 16 GiB). Under `torch.compile` the two settings trace to different graphs, so their losses agree only to ~1e-5 relative, the same order as the recipe's own run-to-run nondeterminism (`cudnn.benchmark`). `--film-init identity` (recipe `FILM_INIT=identity`) zeroes the FiLM projections so each conditioned block starts as the identity (the harness's "identity FiLM" arm); fresh runs only.
+
+Both full and eval checkpoints contain a top-level **`language`** dictionary: format, model, exact revision, prompt source, tokenization version, ordered task IDs/names, exact prompts, and finite float32 `[tasks, 768]` embeddings. Missing/invalid/mismatched language caches fail closed. Full-checkpoint resume uses this cache without reading description metadata or downloading CLIP; it still needs the selected demonstration data for training. Serving needs **neither CLIP nor the dataset** and maps known task IDs to saved embeddings; task changes reset history/action queues as before. The handshake exposes `language_conditioning` and `prompt_source`.
+
+Programmatic setup: construct `ModelConfig(language_conditioning='clip_film', prompt_source=...)`, construct the dataset with `config.dataset_kwargs()`, call `dataset.prepare_language()` (or pass a saved `checkpoint['language']`), then use `build_policy(config, dataset.task_map)` and the dataset normalizer as usual. `dataset.language` supplies checkpoint export metadata. `load_policy` attaches the validated cache for `B1KPolicySession`; no external tokenizer/model is needed.
+
+Offline tests: `source /tmp/dev/env.sh; CUDA_VISIBLE_DEVICES='' .venv/bin/python -m pytest tests/test_b1k_language.py -q`. Fake text encoders cover exact prompt selection, malformed metadata, token boundaries/masks, both prompt modes through training/full/eval checkpoint/exact resume/dataset-free WebSocket serving, FiLM sensitivity and gradients, upstream hybrid parity, recomputation gradient parity, and no-language compatibility. The combined language/B1K/upload/replay-buffer/CV2/timestamp regression passed **243 tests**, with one existing opt-in private-HF upload test skipped. A separate cached real-CLIP CPU `prepare_language()` smoke passed both radio prompt sources. These checks do not claim simulator success or full-batch GPU qualification.
 
 ### Variant and recipe controls
 
@@ -71,27 +91,38 @@ The B1K trainer runs in one process on one GPU (or CPU); it does not implement d
 
 ```bash
 source /tmp/dev/env.sh
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/train_b1k.py \
   --dataset-root /tmp/dev/datasets/2026-challenge-demos \
-  --output-dir /tmp/dev/baselines/diffusion_policy/outputs/radio \
+  --output-dir "$DP_DIR/outputs/radio" \
   --max-steps 110000 --device cuda --num-workers 4 \
-  --resume /tmp/dev/baselines/diffusion_policy/outputs/radio/latest.pt
+  --resume "$DP_DIR/outputs/radio/latest.pt"
 ```
 
-Resume restores architecture, normalization, task selection, model/EMA parameters and EMA counter, AdamW state, seed, batch size, learning rate/weight decay, and Python/NumPy/Torch/CUDA RNG states. Explicit model flags are ignored in favor of the checkpoint. The frame-uniform replacement sampler is independently seeded per optimizer step, so prefetching does not change resumed batch indices. Dataset metadata, selected IDs, file sizes and nanosecond mtimes are fingerprinted to detect selection/mutation mismatches (not a full 3 TB content hash). GPU kernels may still be nondeterministic. Checkpoints use atomic `step-XXXXXXXX.pt` writes and a `latest.pt` symlink; existing step files are never overwritten. `config.json` and `train.jsonl` are run-local.
+Resume restores architecture, normalization, task selection, model/EMA parameters and EMA counter, AdamW state, seed, batch size, learning rate/weight decay, and Python/NumPy/Torch/CUDA RNG states. Explicit model flags are ignored in favor of the checkpoint, except conflicting explicit `--language-conditioning` or `--prompt-source` values fail rather than silently changing language semantics. The frame-uniform replacement sampler is independently seeded per optimizer step, so prefetching does not change resumed batch indices. Dataset metadata, selected IDs, file sizes and nanosecond mtimes are fingerprinted to detect selection/mutation mismatches (not a full 3 TB content hash). GPU kernels may still be nondeterministic. Checkpoints use atomic `step-XXXXXXXX.pt` writes and a `latest.pt` symlink; existing step files are never overwritten. `config.json` and `train.jsonl` are run-local.
 
 ### Long runs, checkpoints, and tracking
 
 By default the trainer computes in FP32 with no architecture changes or gradient accumulation; `--autocast bf16`, `--matmul-precision high` and `--compile` are the opt-in numeric/execution settings measured under [Throughput](#throughput-loader-and-blackwell-gpu) (parameters, gradients, optimizer state and EMA stay FP32 in every mode). A 12-layer image transformer is selected explicitly with `--variant transformer_hybrid_image --n-layer 12 --n-emb 512 --n-head 8`. Set the physical `--batch-size` from a separate single-GPU memory **and full input-pipeline** probe, not from a denoiser-only estimate. For a 300,000-step radio run, use `--task-names turning_on_radio --max-steps 300000`; the trainer does not launch evaluations or uploaders itself.
 
 - `--save-every 2500 --save-total-limit 3` keeps the three newest local resumable `step-XXXXXXXX.pt` files. The default retention limit is **0 (keep all)**, preserving old behavior. `latest.pt` points to the newest completed full checkpoint. `--save-first-step` additionally saves/publishes step 1; it defaults off and does not create an early evaluation export. The final optimizer step always saves a full checkpoint.
-- `--export-every 10000` (default; 0 disables) writes `export_queue/eval/step-XXXXXXXX.pt` exactly on that cadence. These contain only format/type, model configuration, task map, normalizer, EMA state, and step. They contain **no training model, optimizer, training metadata, or RNG**, load directly through `load_policy`/`serve_b1k.py`, and are explicitly rejected by `--resume`. Exporting is not simulator evaluation: a separate evaluator must consume the files.
+- `--export-every 10000` (default; 0 disables) writes `export_queue/eval/step-XXXXXXXX.pt` exactly on that cadence. These contain only format/type, model configuration, task map, normalizer, EMA state, step, and the language cache when enabled. They contain **no training model, optimizer, training metadata, or RNG**, load directly through `load_policy`/`serve_b1k.py`, and are explicitly rejected by `--resume`. Exporting is not simulator evaluation: a separate evaluator must consume the files.
 - Every completed full checkpoint is hardlinked into `export_queue/full/step-XXXXXXXX.pt` **before local retention pruning**. The full queue keeps only its newest file. A separate uploader must first hardlink the discovered queue file into its own staging directory on the same filesystem, retry discovery on `FileNotFoundError`, and then hash/upload the staged inode. That hardlink remains valid when the trainer removes older queue/local names. Evaluation exports are never pruned by the trainer; only an uploader with a verified remote commit should acknowledge/remove them.
 - Checkpoint files are flushed/fsynced and atomically renamed; queue and symlink directory updates are fsynced. An advisory exclusive nonblocking `run.lock` protects the entire trainer lifetime, including resume. The lock file is deliberately retained after exit; deleting an active lock file would defeat writer exclusion.
 - `--wandb-mode disabled|offline|online` defaults to **disabled**, requiring no W&B import or network access. Enable online tracking with `--wandb-mode online --wandb-project PROJECT --wandb-entity ENTITY --wandb-name NAME`; optional `--wandb-id ID` controls the initial run ID. Set `WANDB_API_KEY` via the sourced environment. Online mode fails clearly on missing credentials, initialization/authentication failure, or offline fallback **before constructing the dataset/model**. W&B is pinned in `requirements-b1k.txt`; do not run `wandb login` on this host.
 - The stable W&B ID/project/entity/name are stored in `wandb.json` before initialization and in every full checkpoint. Resume restores identity and rejects conflicting ID/project/entity overrides. Pass `--wandb-mode online` again when resuming online tracking; omission intentionally leaves tracking disabled. `config.json` records effective runtime arguments. `train.jsonl` and W&B share step, loss, gradient norm, learning rate, elapsed time, `data_wait_s`, `compute_s`, `step_s`, `checkpoint_s`, samples/second, and GPU allocated/reserved/peak allocated bytes. CPU runs report zero GPU bytes. GPU timing synchronizes completion; `step_s` excludes checkpoint/logging time, which is reported separately for checkpoint writes.
 
-The default optimizer remains generic AdamW: learning rate `1e-4`, weight decay `1e-6`, betas `(0.9, 0.999)`. To use the upstream transformer parameter grouping explicitly, choose `--optimizer upstream --learning-rate 1e-4 --weight-decay 0.001 --obs-encoder-weight-decay 0.000001 --betas 0.9 0.95`. This calls the actual policy's `get_optimizer`: transformer decay/no-decay groups plus separate image-encoder decay. Lowdim transformers use their corresponding upstream optimizer; non-transformer policies reject this option. Optimizer kind, betas, and encoder decay are restored from full checkpoints; older checkpoints restore the original generic AdamW recipe. This matches optimizer construction, **not** the upstream Hydra warmup/cosine learning-rate schedule; the native trainer still uses constant learning rate.
+The default optimizer remains generic AdamW: learning rate `1e-4`, weight decay `1e-6`, betas `(0.9, 0.999)`. To use the upstream transformer parameter grouping explicitly, choose `--optimizer upstream --learning-rate 1e-4 --weight-decay 0.001 --obs-encoder-weight-decay 0.000001 --betas 0.9 0.95`. This calls the actual policy's `get_optimizer`: transformer decay/no-decay groups plus separate image-encoder decay. Lowdim transformers use their corresponding upstream optimizer; non-transformer policies reject this option. Optimizer kind, betas, and encoder decay are restored from full checkpoints; older checkpoints restore the original generic AdamW recipe.
+
+The upstream learning-rate schedule, EMA exponent and (absence of) gradient clipping are separate flags with the native trainer's historical behavior as defaults: `--lr-scheduler constant|cosine` with `--lr-warmup-steps N` (upstream `get_scheduler`: linear warmup, then cosine decay to zero over `--lr-schedule-steps`, default `--max-steps`; stepped once per optimizer step; the schedule length is fixed at the first launch and restored on resume, and the scheduler state is checkpointed so resume is exact), `--ema-power` (upstream `EMAModel` exponent, default 2/3; the RoboCasa recipe uses 0.75) and `--grad-clip` (default 1.0; `0` trains unclipped like the upstream workspace while still rejecting non-finite gradients). `train.jsonl` logs the learning rate applied at each step. Checkpoints written before these flags resume with constant LR, power 2/3 and clipping at 1.0.
+
+`--grad-accumulation N` splits every optimizer batch into N equal micro-batches (forward and backward each, `loss / N`), with one optimizer, schedule and EMA step per `--batch-size` samples. The sampler still draws the same seeded `--batch-size` indices per step, so a run with accumulation sees exactly the samples a single-pass run would; only the peak activation memory (1/N) and the per-micro-batch random draws (crops, dropout, diffusion noise) differ. `train.jsonl` keeps one record per optimizer step (loss = mean of the micro-batch losses, timings summed). Needed for the RoboCasa365 image size at the recorded batch: 224 px crops take ~66 MB of activations per sample, so batch 8,960 (~580 GiB single-pass) runs as `GRAD_ACCUMULATION=4` at **143.5 GiB peak** and **3.4 s/step** with FiLM recomputation, or **2.56 s/step at 210 GiB** without it (`FILM_RECOMPUTE=off`, the preset's default since it fits on this host). At batch 1,024 (single pass, the recipe's `reduce-overhead` CUDA graphs) the same configuration runs at **0.29 s/step** (97 GiB) without recomputation and 0.36 s/step (67 GiB) with it.
+
+> **Batch size is an optimization choice here, not a throughput one.** Throughput is the same at both batch sizes: 1,024 / 0.29 s ≈ 3.5k samples/s versus 8,960 / 2.56 s ≈ 3.5k samples/s — the GPU is saturated either way. 5,000 steps at batch 1,024 take ~24 min instead of ~3.6 h, but see 8.75× fewer samples; compare runs of different batch sizes by samples seen (or wall time), not by step count.
+
+**Throughput at 224 px** (`/tmp/dev/audits/dp-lang-goal-20260917/rc-speed-ablations.log`, `rc-profile-step.py`; one optimizer step of 4 × 2,240 on one GPU, compiled, bf16): with recomputation off the GPU time is cuDNN convolutions 40%, GroupNorm/ReLU/FiLM Triton kernels 35%, the stem max-pool 16% (its backward is fused with the GroupNorm backward by Inductor), transformer matmuls 2%. Measured and rejected at this resolution, all exact or forward-exact: `channels_last` for the encoder (+6% with recomputation off, +14% with it: the GroupNorm layout round trips seen at 86 px); an opaque int8-index max-pool kernel (3× faster than Inductor's on its own, but the opaque op makes Inductor materialize the fp32 stem tensors it otherwise fuses through: +0.55 s/step); casting the stem GroupNorm output to bf16 before ReLU/pool (+0.4 s/step, the fusion changes again); running GroupNorm through ATen's fused kernels instead of Inductor's decomposition (rejects Inductor's non-contiguous inputs). The FiLM recomputation choice is the only exact lever left at this resolution; the rest is intrinsic to ResNet18-GroupNorm at 224 px in this stack.
+
+**RoboCasa365 Diffusion Policy preset.** `scripts/b1k/run_radio_300k.sh` with `PRESET=robocasa365` reproduces the [RoboCasa365 Diffusion Policy baseline](https://github.com/robocasa-benchmark/diffusion_policy) configuration (`train_diffusion_transformer_bs192`): 256 px images with 224 px crops, horizon 10 / 2 observation steps / 8 executed actions, 12×512×8 transformer with a 4-layer transformer condition encoder (`--n-cond-layers 4`), CLIP ViT-L/14 FiLM language conditioning on the task description with **no one-hot task id** (`--no-task-onehot`), upstream parameter groups (AdamW 1e-4, betas 0.9/0.95, weight decay 1e-3 transformer / 1e-6 encoder), cosine schedule with 1000 warmup steps sized for 500k steps (their `num_epochs × max_train_steps`; the released checkpoint is epoch 500 = 250k steps, i.e. mid-decay), EMA power 0.75, no gradient clipping, batch 192, 250k steps. It keeps this trainer's throughput settings (frame cache keyed by image size, bf16 autocast, TF32, `torch.compile`, math attention, DDPM 100/100). Differences that remain: their data are 300 tasks with per-episode instructions, ours the selected B1K tasks with one description each; their robomimic encoder and ours are equivalent in structure (FiLM after each ResNet18 block, spatial softmax, 64-D projection).
 
 With the frame cache, `--num-workers 8` and an unset `--loader-batch-size` (one worker task per optimizer batch, no main-process concatenation) keep the data wait near zero at both 1,024 and 8,960 samples per step. Without it, `--loader-batch-size 128 --num-workers 24 --prefetch-factor 1 --cpu-threads 2 --worker-cpu-threads 1` is an example input-pipeline configuration to benchmark for very large physical batches, not a fixed machine recommendation. Unset `--loader-batch-size` preserves one worker task per optimizer batch. When set, the sampler splits the same seeded sample-index list into bounded decoding chunks, spreads them across workers, then concatenates ordered chunks into **one unchanged physical optimizer batch** (including a shorter final chunk). Pinned worker tensors remain pinned after concatenation; there is no gradient accumulation or changed update cadence. Worker prefetch scales with the decoding chunk size rather than the physical optimizer batch. The defaults are prefetch factor 1, main CPU threads 2, and worker CPU threads 1; Torch, BLAS, OpenCV, and Arrow CPU/I/O pools are capped. PyAV decoders already use one thread. Per-batch dataset reads group episode/timestamp accesses for cache reuse and then restore the original sample order. For a small selected task, increasing `--episode-cache-size` to its episode count can avoid repeated parquet filtering; account for per-worker cache memory.
 
@@ -99,7 +130,7 @@ Offline regression command (no CUDA initialization or W&B/HF access):
 
 ```bash
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 taskset -c 90-119 .venv/bin/python -m pytest \
   tests/test_b1k.py tests/test_replay_buffer.py::test tests/test_cv2_util.py \
   tests/test_timestamp_accumulator.py -q
@@ -133,7 +164,7 @@ Frame cache (pixel-exact, opt-in `--frame-cache DIR`):
 
 ```bash
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES='' taskset -c 90-119 .venv/bin/python scripts/b1k/build_frame_cache.py \
   --dataset-path /tmp/dev/datasets/2026-challenge-demos --task-names turning_on_radio \
   --cache-dir /tmp/dev/datasets/2026-challenge-demos-frame-cache-96 --image-size 96 --workers 28 --verify 512
@@ -167,7 +198,7 @@ Validation runs with the trainer on real data (`runs/` under the audit directory
 
 Input proprio is 61-D; the 25-D R1Pro state is exactly `[0:3, 53:57, 3:10, 24:26, 28:35, 49:51]`. Actions remain the original **23 joint/base commands**: velocity/absolute semantics are preserved. There is **no extra delta transform and no 6D rotation conversion**.
 
-Every policy has explicit categorical task conditioning: one-hot channels, ordered by sorted dataset task ID, are appended to the 25-D state. These remain literal 0/1 under normalization. Task maps are checkpoint-local; unseen IDs are rejected. This is not language conditioning.
+Categorical task conditioning is optional: with `--task-onehot`, one-hot channels ordered by sorted dataset task ID are appended to the 25-D state and remain literal 0/1 under normalization. The trainer CLI defaults to `--no-task-onehot` (state stays 25-D), so with several selected tasks the policy must get the task from `--language-conditioning clip_film` — the trainer rejects a multi-task configuration with no task signal. `ModelConfig.task_onehot` defaults to `True` so checkpoints written before the field existed keep their one-hot channels; the choice is recorded in the checkpoint and honored by the dataset, normalizer, policy input width and the server. Task maps are checkpoint-local and unseen IDs are rejected in both modes (the server still needs `task_id`, also to select the language embedding).
 
 State and action use upstream `LinearNormalizer.fit(mode='limits')` semantics: per-dimension min/max to [-1,1], `range_eps=1e-4`, near-constant dimensions use unit scale and offset `-min`, and reported standard deviation uses sample variance. Streaming accumulation uses float64 and stores float32. RGB is converted from uint8 RGB/RGBA, alpha dropped, resized with centered zero padding using OpenCV bilinear interpolation, then CHW float32 /255; the upstream image normalizer maps [0,1] to [-1,1]. Training and serving share preprocessing.
 
@@ -177,8 +208,9 @@ The linear normalizer does **not clip** values outside the fitted range. DDPM/DD
 
 ```bash
 source /tmp/dev/env.sh
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/serve_b1k.py \
-  --model-path /tmp/dev/baselines/diffusion_policy/outputs/radio/latest.pt \
+  --model-path "$DP_DIR/outputs/radio/latest.pt" \
   --host 0.0.0.0 --port 8000 --device cuda --action-horizon 8
 ```
 
@@ -243,7 +275,7 @@ Video is **blocked**, not passed or hidden as a skipped test. Importing its actu
 
 ```bash
 source /tmp/dev/env.sh
-cd /tmp/dev/baselines/diffusion_policy
+cd "$DP_DIR"
 CUDA_VISIBLE_DEVICES='' .venv/bin/python -m diffusion_policy.b1k.variant_matrix \
   --dataset-path /tmp/dev/datasets/2026-challenge-demos \
   --task-names turning_on_radio --max-episodes 2 \
