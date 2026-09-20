@@ -1,5 +1,36 @@
 # Transformer Diffusion Policy radio run — 2026-09-16
 
+## Goal-image conditioning smoke matrix on the nav + pickup mixture — 2026-09-20
+
+Branch `goal` (worktree `/tmp/dev/baselines/diffusion_policy-goal`; base `my@d149d0f` + `lang_optimized_robocasa365@50c24f4`; b1k.md "Goal-image conditioning") and its variant branches `goal-image-early`, `goal-image-late`, `goal-image-language-early`, `goal-image-language-late` (worktrees `/tmp/dev/baselines/diffusion_policy-goal-<variant>`, own `.venv` each, one condition pinned in `scripts/b1k/run_variant_smoke.sh`). Dataset: `/tmp/dev/datasets/2026-challenge-demos-radio-navpickup-goal`, the merge of the nav-goal and pickup-goal skill-segment datasets built by the ACT branch's `scripts/b1k/merge_lerobot_roots.py` (400 episodes, 257,818 frames, 255,018 horizon-16 sequences; tasks `turning_on_radio-navigate_to_radio` (0) and `turning_on_radio-pick_up_radio` (1)); camera videos hard-linked from the challenge demos, so the existing 96 px frame cache validated bit-identically without a rebuild. Language = the task name; goal image = the last frame of the episode's head camera (`--goal-source episode_last`, read through the frame cache).
+
+Recipe `scripts/b1k/run_navpickup_conditioning_smoke.sh`: **5,000 optimizer steps**, batch **8,960**, the b1k preset (12 × 512 image Diffusion Transformer, 96 px / 86 px crops, horizon 16, observation history 2, DDPM 100, AdamW 1e-4 wd 1e-6, constant LR, EMA power 2/3, gradient clip 1.0, seed 42), frame cache, TF32 + bf16 autocast, `--compile default`, checkpoints at 1 / 2,500 / 5,000, eval export at 5,000, W&B project `b1k-challenge-2026-diffusion-policy` (ids `dpnp-<condition>-20260920`). One GPU and 30 cores per run; launched at 01:00 PDT in the requested order — vanilla and language first (GPUs 1 and 3), then image-only, then image + language (queued behind the previous run on the same GPU). The `my` venv needed `six` installed (robomimic 0.2.0 imports it without declaring it; the language branch's requirements already list it). Logs/exit files: `/tmp/dev/logs/navpickup-dp-transformer12x512-<condition>-bs8960-5k-20260920.{log,exit}`; run directories `outputs/navpickup-dp-transformer12x512-<condition>-bs8960-5k-20260920/` inside the checkout that trained them (`outputs/<run>.trainer_commit.txt` records the commit).
+
+| Condition | Checkout / commit | Conditioning |
+| --- | --- | --- |
+| vanilla | `/tmp/dev/baselines/diffusion_policy` (`my@d149d0f`) | one-hot task id appended to the state (`my` always does; on two tasks this is the **task-ID-conditioned** baseline, not the plan's strict N) |
+| language | `/tmp/dev/baselines/diffusion_policy_lang_goal` (`lang_optimized_robocasa365@50c24f4`) | b1k preset + `--language-conditioning clip_film --prompt-source task_name --no-task-onehot` (RoboCasa365-style CLIP → ResNet FiLM; the branch's full RoboCasa365 recipe preset is not used) |
+| image-early / image-late | `goal-image-early` / `goal-image-late` | `--regime image --no-task-onehot`: head goal paired at the stem / one goal condition token |
+| image_language-early / -late | `goal-image-language-early` / `-late` | `--regime image_language`: clip_film (task name) + the same goal path; goal pass with FiLM at the identity |
+
+Training-loss table (ACT branch's `scripts/b1k/summarize_runs.py`; means over the last 100 steps of the identical seed-42 batch sequence; the `none` row is the plan's strict N control, added after the requested eight runs on a freed GPU). All seven runs completed 5,000 optimizer steps with exit status 0. These are 5,000-step smoke runs (1.7 % of the radio schedule) with training losses only — no held-out or simulator evaluation is implied:
+
+| Run | commit | regime | steps | loss (4,901–5,000) | loss (1–100) | s/step | peak GiB | hours |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| vanilla (`my`, one-hot task id) | `d149d0f` | — | 5000 | 0.04527 | 0.3377 | 0.604 | 157 | 0.90 |
+| none (strict N: no task id, language or goal) | `46e33d8` | none | 5000 | 0.04513 | 0.3435 | 0.603 | 157 | 0.87 |
+| language (clip_film, task name) | `50c24f4` | — | 5000 | 0.04602 | 0.3429 | 0.678 | 129 | 1.00 |
+| image-early (regime image) | `6bbe70b` | image | 5000 | 0.04512 | 0.3392 | 0.610 | 160 | 0.90 |
+| image-late (regime image) | `d3f1b07` | image | 5000 | 0.04543 | 0.3408 | 0.785 | 193 | 1.15 |
+| image_language-early | `3b1ebdb` | image_language | 5000 | 0.04566 | 0.3409 | 0.675 | 131 | 0.97 |
+| image_language-late | `4e3575d` | image_language | 5000 | 0.04572 | 0.3340 | 0.849 | 164 | 1.23 |
+
+Observations (training loss at 1.7 % of the schedule; single seed):
+
+- Every condition trains stably at batch 8,960. The paired stem costs 1 % per step; late fusion costs 30 % (a seventh image encode per sample plus the extra condition token, 36 GiB more activation memory); the CLIP FiLM path costs 12 % (its recomputation of the FiLM blocks halves the activation memory, 129–131 GiB) and adds the eight FiLM projections per camera.
+- All seven conditions end within 2 % of each other (0.0451–0.0460); the strict N control without any task signal matches vanilla, so on this two-task mixture the 96 px observations with two-step history identify the task/phase by themselves and the extra modalities have nothing to add to the training loss at this point.
+- `scripts/b1k/goal_sensitivity_probe.py` (offline, 6 training sequences, EMA weights, matched initial noise, own goal vs. the other task's goal; normalized [−1, 1] action units): image-early 0.0212 / 0.0231, image_language-early 0.0188 / 0.0244, **image-late 0.0230 / 0.0232, image_language-late 0.0213 / 0.0213**. The early-fusion policies have started to read the goal (predictions move by up to 0.2 when it is swapped); the late-fusion policies are goal-insensitive after 5,000 steps (max prediction change ≤ 0.02) — the opposite of ACT, where the late goal tokens were used strongly and the zero-initialized early stem was not. Plausible reasons to keep in view for the full runs: the DP late goal is one 64-D SpatialSoftmax keypoint vector (32 keypoint coordinates of the goal image) competing with two observation tokens of the same kind, whereas ACT's late fusion appends the goal's full 8×8×512 feature grid; and the DP observations already determine the loss here. Either way this is a diagnostic of goal use, not goal-following evidence (no rollouts, training sequences).
+
 ## Task-name CLIP/FiLM smoke run on the optimized trainer — 2026-09-17 (branch `lang_optimized`; the RoboCasa365-configuration work continues on `lang_optimized_robocasa365`)
 
 After merging the language branch into the throughput work, the radio recipe was launched with `--language-conditioning clip_film --prompt-source task_name` (prompt = the literal `turning_on_radio`), physical batch **8,960**, frame cache, bf16 autocast, TF32, `torch.compile default`, math attention — i.e. the optimized recipe below plus language:
