@@ -21,6 +21,7 @@ import math
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from diffusion_policy.b1k.language import LANGUAGE_DIM, LANGUAGE_KEY
@@ -59,7 +60,54 @@ def identity_initialize_film(root):
     return count
 
 
-class PairedConv2d(nn.Conv2d):
+def space_to_depth_conv2d(x, weight, bias, padding):
+    """A stride-2 convolution as a stride-1 convolution over the 2x2 space-to-depth rearrangement of the padded input.
+
+    Padded pixel p = i + padding = 2 * o + tap for output o has the parity of the tap and space-to-depth index
+    o + tap // 2, so gathering the four parity blocks into channels turns the k x k / stride-2 kernel into a
+    ceil(k/2) x ceil(k/2) / stride-1 kernel over 4x the channels. Every output is the same sum of products with the
+    weights re-indexed (no arithmetic on them); only cuDNN's accumulation order changes. For the ResNet18 stem
+    (7x7, 3 channels: cuDNN pads them to 8 anyway) this runs ~30% faster than the 7x7/stride-2 kernels.
+    """
+    n, c, h, w = x.shape
+    k = weight.shape[-1]
+    out_h, out_w = (h + 2 * padding - k) // 2 + 1, (w + 2 * padding - k) // 2 + 1
+    hp, wp = h + 2 * padding, w + 2 * padding
+    x = F.pad(x, (padding, padding + wp % 2, padding, padding + hp % 2))  # even padded size for the 2x2 split
+    hp, wp = hp + hp % 2, wp + wp % 2
+    x = x.view(n, c, hp // 2, 2, wp // 2, 2).permute(0, 3, 5, 1, 2, 4).reshape(n, 4 * c, hp // 2, wp // 2)
+    k2 = (k + 1) // 2
+    weight = F.pad(weight, (0, 2 * k2 - k, 0, 2 * k2 - k))
+    weight = weight.view(weight.shape[0], c, k2, 2, k2, 2).permute(0, 3, 5, 1, 2, 4).reshape(-1, 4 * c, k2, k2)
+    return F.conv2d(x, weight, bias)[..., :out_h, :out_w]
+
+
+class SpaceToDepthConv2d(nn.Conv2d):
+    """The stem convolution, computed through `space_to_depth_conv2d` under torch.compile (same parameters and
+    state-dict keys). Eager execution keeps the plain convolution, so eager outputs stay bit-identical to
+    robomimic's encoder; the compiled training path computes the same sums in another order."""
+
+    def __init__(self, conv):
+        super().__init__(conv.in_channels, conv.out_channels, conv.kernel_size, conv.stride, conv.padding,
+                         conv.dilation, conv.groups, conv.bias is not None, conv.padding_mode)
+        with torch.no_grad():
+            self.weight.copy_(conv.weight)
+            if conv.bias is not None:
+                self.bias.copy_(conv.bias)
+        self.space_to_depth = (self.stride == (2, 2) and self.dilation == (1, 1) and self.groups == 1
+                               and self.padding_mode == 'zeros' and self.kernel_size[0] == self.kernel_size[1]
+                               and self.padding[0] == self.padding[1])
+
+    def _stem_forward(self, x, weight):
+        if self.space_to_depth and torch.compiler.is_compiling():
+            return space_to_depth_conv2d(x, weight, self.bias, self.padding[0])
+        return self._conv_forward(x, weight, self.bias)
+
+    def forward(self, x):
+        return self._stem_forward(x, self.weight)
+
+
+class PairedConv2d(SpaceToDepthConv2d):
     """Stem convolution accepting a camera image channel-stacked with its goal image (goal-image early fusion).
 
     For a 6-channel `[current; goal]` input it computes `conv(current) + conv_goal(goal)`: one 6-channel
@@ -68,20 +116,58 @@ class PairedConv2d(nn.Conv2d):
     inputs run the plain convolution. State-dict keys stay `weight`/`bias` plus `goal_weight`.
     """
     def __init__(self, conv):
-        super().__init__(conv.in_channels, conv.out_channels, conv.kernel_size, conv.stride, conv.padding,
-                         conv.dilation, conv.groups, conv.bias is not None, conv.padding_mode)
-        with torch.no_grad():
-            self.weight.copy_(conv.weight)
-            if conv.bias is not None:
-                self.bias.copy_(conv.bias)
+        super().__init__(conv)
         self.goal_weight = nn.Parameter(torch.zeros_like(self.weight))
 
     def forward(self, x):
         if x.shape[1] == self.in_channels:
-            return super().forward(x)
+            return self._stem_forward(x, self.weight)
         if x.shape[1] != 2 * self.in_channels:
             raise ValueError(f'PairedConv2d expects {self.in_channels} or {2 * self.in_channels} channels, got {x.shape[1]}')
-        return self._conv_forward(x, torch.cat([self.weight, self.goal_weight.to(self.weight.dtype)], dim=1), self.bias)
+        return self._stem_forward(x, torch.cat([self.weight, self.goal_weight.to(self.weight.dtype)], dim=1))
+
+
+class _ScatterMaxPool2d(torch.autograd.Function):
+    """max_pool2d whose backward scatter-adds every output gradient to its argmax position.
+
+    Forward is ATen's max_pool2d_with_indices, so values, indices and tie-breaking are unchanged. ATen's (and
+    Inductor's) backward gathers the up-to-four overlapping windows' int64 indices for every input pixel and compares
+    them; this scatter reads each index once and accumulates in float32 like ATen before casting back. Same sums,
+    the accumulation order of overlapping windows is nondeterministic like cuDNN's convolution backward.
+    """
+
+    @staticmethod
+    def forward(ctx, x, kernel_size, stride, padding):
+        out, indices = F.max_pool2d(x, kernel_size, stride, padding, return_indices=True)
+        ctx.save_for_backward(indices)
+        ctx.input_shape, ctx.dtype = x.shape, x.dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        indices, = ctx.saved_tensors
+        n, c, h, w = ctx.input_shape
+        grad_out = grad_out.to(torch.float32)
+        # Accumulated channels-last: torch.compile runs the stem's convolutions/GroupNorm in that memory format, and a
+        # fixed NCHW result here made Inductor fuse a layout transpose into the stem's GroupNorm backward (13x slower
+        # than the pooling itself). Eager callers accept any strides.
+        flat = torch.zeros((n, h * w, c), dtype=torch.float32, device=grad_out.device)
+        flat.scatter_add_(1, indices.flatten(2).transpose(1, 2), grad_out.flatten(2).transpose(1, 2))
+        return flat.view(n, h, w, c).permute(0, 3, 1, 2).to(ctx.dtype), None, None, None
+
+
+class ScatterMaxPool2d(nn.Module):
+    """Drop-in for the ResNet stem's MaxPool2d(3, 2, 1): the scatter-add backward above under torch.compile, ATen's
+    deterministic max_pool2d otherwise (no parameters)."""
+
+    def __init__(self, kernel_size=3, stride=2, padding=1):
+        super().__init__()
+        self.kernel_size, self.stride, self.padding = kernel_size, stride, padding
+
+    def forward(self, x):
+        if torch.compiler.is_compiling():
+            return _ScatterMaxPool2d.apply(x, self.kernel_size, self.stride, self.padding)
+        return F.max_pool2d(x, self.kernel_size, self.stride, self.padding)
 
 
 class FiLMResidualBlock(nn.Module):
@@ -105,8 +191,10 @@ class ResNet18FiLM(nn.Module):
         if group_norm:
             replace_submodules(backbone, lambda module: isinstance(module, nn.BatchNorm2d),
                                lambda module: nn.GroupNorm(module.num_features // 16, module.num_features))
-        conv1 = PairedConv2d(backbone.conv1) if paired_stem else backbone.conv1
-        self.stem = nn.Sequential(conv1, backbone.bn1, backbone.relu, backbone.maxpool)
+        conv1 = PairedConv2d(backbone.conv1) if paired_stem else SpaceToDepthConv2d(backbone.conv1)
+        pool = backbone.maxpool
+        self.stem = nn.Sequential(conv1, backbone.bn1, backbone.relu,
+                                  ScatterMaxPool2d(pool.kernel_size, pool.stride, pool.padding))
         self.blocks = nn.ModuleList(FiLMResidualBlock(block, film) for layer in (
             backbone.layer1, backbone.layer2, backbone.layer3, backbone.layer4) for block in layer)
         self.film = film

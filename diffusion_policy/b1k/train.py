@@ -205,9 +205,15 @@ class EMAUpdater:
 
 
 def compile_policy(policy, mode):
-    """Compile the two hot modules in place without changing the module tree or state_dict keys."""
-    for module in (policy.obs_encoder, policy.model) if hasattr(policy, 'obs_encoder') else (policy.model,):
+    """Compile the hot entry points in place without changing the module tree or state_dict keys."""
+    encoder = getattr(policy, 'obs_encoder', None)
+    for module in (encoder, policy.model) if encoder is not None else (policy.model,):
         module.forward = torch.compile(module.forward, mode=mode)
+    if getattr(encoder, 'goal_fusion', 'none') == 'late':
+        # Late goal fusion runs a seventh ResNet pass per sample through this second entry point of the encoder.
+        # Left eager it ran unfused ATen GroupNorm/ReLU/cast kernels, cuDNN NCHW<->NHWC transposes around every
+        # convolution and four crop-index `.item()` device syncs per step (about a fifth of the optimizer step).
+        encoder.encode_goals = torch.compile(encoder.encode_goals, mode=mode)
 
 
 def wandb_metadata(args):
