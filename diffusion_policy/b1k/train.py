@@ -18,7 +18,8 @@ import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader, Sampler
 
-from diffusion_policy.b1k.dataset import B1KLeRobotDataset, images_to_float
+from diffusion_policy.b1k.dataset import (B1KLeRobotDataset, expand_task_groups, images_to_float, parse_settle_steps,
+                                          resolve_episode_split)
 from diffusion_policy.b1k.model import POLICY_TARGETS, ModelConfig, build_policy, load_checkpoint
 from diffusion_policy.b1k.robot import CAMERAS
 from diffusion_policy.common.pytorch_util import dict_apply
@@ -270,6 +271,13 @@ def sync_batchnorm_buffers(policy, averaged_policy):
                 getattr(averaged_module, name).copy_(buffer)
 
 
+def selection_record(dataset, args):
+    """Training data selection saved with full and evaluation checkpoints; resume rebuilds and compares it."""
+    return {'task_names': list(dataset.task_map.values()), 'max_episodes': args.max_episodes,
+            'episode_indices': [row['episode_index'] for row in dataset.episodes], 'episode_split': args.episode_split,
+            'settle_steps': dataset.settle}
+
+
 def save_checkpoint(output, policy, ema, optimizer, config, dataset, step, args):
     checkpoint = {
         'format': 'diffusion_policy_b1k_v1', 'checkpoint_type': 'full',
@@ -282,9 +290,7 @@ def save_checkpoint(output, policy, ema, optimizer, config, dataset, step, args)
                      'learning_rate': args.learning_rate, 'weight_decay': args.weight_decay,
                      'optimizer': args.optimizer, 'betas': tuple(args.betas),
                      'obs_encoder_weight_decay': args.obs_encoder_weight_decay},
-        'selection': {'task_names': list(dataset.task_map.values()),
-                      'max_episodes': args.max_episodes,
-                      'episode_indices': [row['episode_index'] for row in dataset.episodes]},
+        'selection': selection_record(dataset, args),
         'dataset_fingerprint': dataset.fingerprint(),
         'rng': {'torch': torch.get_rng_state(),
                 'numpy': (np.random.get_state()[0], torch.from_numpy(np.random.get_state()[1].astype(np.int64)),
@@ -305,11 +311,11 @@ def save_checkpoint(output, policy, ema, optimizer, config, dataset, step, args)
     return path
 
 
-def export_checkpoint(output, ema, config, task_map, step):
+def export_checkpoint(output, ema, config, task_map, step, selection=None):
     checkpoint = {
         'format': 'diffusion_policy_b1k_v1', 'checkpoint_type': 'eval',
         'config': config.to_dict(), 'task_map': task_map,
-        'normalizer': ema.averaged_model.normalizer.state_dict(),
+        'selection': selection, 'normalizer': ema.averaged_model.normalizer.state_dict(),
         'ema_model': ema.averaged_model.state_dict(), 'step': step,
     }
     path = output / 'export_queue' / 'eval' / f'step-{step:08d}.pt'
@@ -327,10 +333,30 @@ def gpu_memory_metrics(device):
             'gpu_peak_allocated_bytes': torch.cuda.max_memory_allocated(device)}
 
 
+class ExplicitChoice(argparse.Action):
+    """Store the value and record that it was given (`<dest>_explicit`), for options checked against a checkpoint."""
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f'{self.dest}_explicit', True)
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument('--dataset-path', '--dataset-root', dest='dataset_path', required=True)
-    result.add_argument('--task-names', nargs='+')
+    result.add_argument('--task-names', nargs='+',
+                        help='Tasks or task groups of <dataset>/isg_meta/task_groups.json (default: every local task; '
+                             'with an episode split, every task of the split)')
+    result.add_argument('--episode-split', default='auto', action=ExplicitChoice,
+                        help='auto: <dataset>/isg_meta/train_split.json if present, else every episode of the selected '
+                             'tasks; none; or an isg-episode-split/v1 file. Trains on the split\'s train episodes of the '
+                             'selected tasks (default: all tasks of the split). Resume reuses the checkpoint\'s split; '
+                             'an explicit value must select the same episodes')
+    result.add_argument('--settle-steps', default='all', action=ExplicitChoice,
+                        help='Frames kept after each episode\'s program (the recorded settle window, where the robot '
+                             'holds still), cut at load time using <dataset>/isg_meta/settle_windows.json: all (default: '
+                             'every recorded frame), a number of frames (0 keeps the program only) or a decimal fraction '
+                             'of the program length (0.2), capped at the recorded window. Resume reuses the '
+                             'checkpoint\'s value; an explicit value must equal it')
     result.add_argument('--output-dir', required=True)
     result.add_argument('--max-steps', type=int, default=100000)
     result.add_argument('--batch-size', type=int, default=64)
@@ -432,6 +458,7 @@ def main(argv=None):
         raise ValueError('Learning rate must be positive and weight decay nonnegative')
     if not all(0 <= beta < 1 for beta in args.betas):
         raise ValueError('AdamW betas must be in [0, 1)')
+    args.settle_steps = parse_settle_steps(args.settle_steps)
     output = Path(args.output_dir).resolve()
     if output.is_relative_to(Path(args.dataset_path).resolve()):
         raise ValueError('--output-dir must not be inside the read-only dataset')
@@ -444,23 +471,48 @@ def main(argv=None):
 def run_training(args, device, output):
     configure_cpu_threads(args.cpu_threads)
     checkpoint = load_checkpoint(args.resume) if args.resume else None
+    args.requested_task_names = args.task_names
+    args.task_names = expand_task_groups(args.dataset_path, args.task_names)
+    if args.task_names != args.requested_task_names:
+        print(json.dumps({'task_groups': {'requested': args.requested_task_names, 'tasks': args.task_names}}),
+              flush=True)
     if checkpoint:
         if checkpoint.get('checkpoint_type') == 'eval' or 'optimizer' not in checkpoint:
             raise ValueError('Cannot resume training from an eval-only checkpoint; use a full checkpoint')
         config = ModelConfig(**checkpoint['config'])
+        saved_tasks = checkpoint['selection']['task_names']
+        if args.task_names is not None and set(args.task_names) != set(saved_tasks):
+            raise ValueError(f'--task-names {args.requested_task_names} select {args.task_names}, but the checkpoint '
+                             f'trained on {saved_tasks}')
         if args.task_names is None:
-            args.task_names = checkpoint['selection']['task_names']
+            args.task_names = saved_tasks
         if args.max_episodes is None:
             args.max_episodes = checkpoint['selection']['max_episodes']
+        split = checkpoint['selection'].get('episode_split')
+        if getattr(args, 'episode_split_explicit', False):
+            requested = resolve_episode_split(args.dataset_path, args.episode_split, args.task_names)
+            if (requested or {}).get('episodes') != (split or {}).get('episodes'):
+                raise ValueError('--episode-split selects other episodes than the resumed checkpoint')
+        saved_settle = (checkpoint['selection'].get('settle_steps') or {}).get('spec', 'all')
+        if getattr(args, 'settle_steps_explicit', False) and args.settle_steps != saved_settle:
+            raise ValueError(f'--settle-steps {args.settle_steps} conflicts with the resumed checkpoint ({saved_settle})')
+        args.settle_steps = saved_settle
         for key, value in {'optimizer': 'adamw', 'betas': (0.9, 0.999),
                            'obs_encoder_weight_decay': 1e-6, **checkpoint['training']}.items():
             setattr(args, key, value)
     else:
+        split = resolve_episode_split(args.dataset_path, args.episode_split, args.task_names)
+        if split:
+            args.task_names = split['tasks']
         values = {key: getattr(args, key) for key in ModelConfig.__dataclass_fields__ if hasattr(args, key)}
         for key in ('cameras', 'down_dims', 'crop_shape', 'resize_shape'):
             if values[key] is not None:
                 values[key] = tuple(values[key])
         config = ModelConfig(**values, clip_sample=not args.no_clip_sample)
+    args.episode_split = split
+    if split:
+        print(json.dumps({'episode_split': {'name': split['name'], 'file': split['file'],
+                                            'episodes': len(split['episodes']), 'tasks': split['tasks']}}), flush=True)
     config.validate()
     args.variant = config.variant
     if args.optimizer == 'upstream' and not config.variant.startswith('transformer_'):
@@ -478,7 +530,8 @@ def run_training(args, device, output):
             args.dataset_path, args.task_names, **config.dataset_kwargs(),
             episode_cache_size=args.episode_cache_size, parquet_cache_mb=args.parquet_cache_mb,
             max_episodes=args.max_episodes, image_dtype='uint8', frame_cache=args.frame_cache,
-            video_max_open=args.video_max_open)
+            video_max_open=args.video_max_open, episodes=split['episodes'] if split else None,
+            settle_steps=args.settle_steps)
         if checkpoint and (dataset.task_map != checkpoint['task_map'] or
                            [row['episode_index'] for row in dataset.episodes] != checkpoint['selection']['episode_indices'] or
                            dataset.fingerprint() != checkpoint['dataset_fingerprint']):
@@ -529,7 +582,8 @@ def run_training(args, device, output):
             generator=torch.Generator().manual_seed(args.seed),
             **({'multiprocessing_context': 'spawn', 'prefetch_factor': args.prefetch_factor} if args.num_workers else {}))
         (output / 'config.json').write_text(json.dumps({
-            'model': config.to_dict(), 'tasks': dataset.task_map, 'training': vars(args)}, indent=2, default=str))
+            'model': config.to_dict(), 'tasks': dataset.task_map, 'training': vars(args), 'settle_steps': dataset.settle},
+            indent=2, default=str))
         if device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats(device)
         with (output / 'train.jsonl').open('a') as log:
@@ -563,7 +617,7 @@ def run_training(args, device, output):
                 compute_s = time.monotonic() - compute_start
                 checkpoint_start = time.monotonic()
                 if args.export_every and step % args.export_every == 0:
-                    path = export_checkpoint(output, ema, config, dataset.task_map, step)
+                    path = export_checkpoint(output, ema, config, dataset.task_map, step, selection_record(dataset, args))
                     print(f'Evaluation export: {path}', flush=True)
                 if step % args.save_every == 0 or step == args.max_steps or (args.save_first_step and step == 1):
                     path = save_checkpoint(output, policy, ema, optimizer, config, dataset, step, args)
