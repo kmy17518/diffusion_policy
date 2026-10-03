@@ -40,7 +40,7 @@ class RunningStats:
         }.items()}
 
 
-def fit_normalizer(batches, cameras):
+def fit_normalizer(batches, cameras, proprio_size):
     stats = {key: RunningStats() for key in ('state', 'action')}
     for batch in batches:
         for key, tracker in stats.items():
@@ -50,8 +50,8 @@ def fit_normalizer(batches, cameras):
         field = get_range_normalizer_from_stat(tracker.stats(), range_eps=1e-4)
         if key == 'state':
             # Categorical channels retain their literal one-hot values.
-            field.params_dict['scale'].data[25:] = 1
-            field.params_dict['offset'].data[25:] = 0
+            field.params_dict['scale'].data[proprio_size:] = 1
+            field.params_dict['offset'].data[proprio_size:] = 0
         normalizer[key] = field
     for camera in cameras:
         normalizer[camera] = get_image_range_normalizer()

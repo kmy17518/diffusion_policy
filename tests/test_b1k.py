@@ -1,8 +1,10 @@
 import asyncio
 import copy
+import hashlib
 import json
 import pickle
 from pathlib import Path
+import shutil
 
 import av
 import h5py
@@ -13,11 +15,12 @@ import pytest
 import torch
 import zarr
 
-from diffusion_policy.b1k.dataset import B1KLeRobotDataset, EpisodeSequenceIndex, VideoReader, images_to_float
+from diffusion_policy.b1k.dataset import (B1KLeRobotDataset, EpisodeSequenceIndex, VideoReader, expand_task_groups,
+                                          images_to_float, parse_settle_steps, resolve_episode_split, settle_frames)
 from diffusion_policy.b1k.frame_cache import FrameCacheReader, build_frame_cache, verify_frame_cache
 from diffusion_policy.b1k.model import ModelConfig, build_policy, load_policy
 from diffusion_policy.b1k.normalization import fit_normalizer
-from diffusion_policy.b1k.robot import CAMERAS, PROPRIO_KEY, STATE_INDICES, extract_state, resize_rgb
+from diffusion_policy.b1k.robot import CAMERAS, PROPRIO_KEY, STATE_INDICES, extract_state, goal_key, resize_rgb
 from diffusion_policy.b1k.serve import B1KPolicySession, WebsocketPolicyServer, packb, unpackb
 from diffusion_policy.b1k.train import StepBatchSampler, main as train_main, parser as train_parser
 from diffusion_policy.b1k.variant_matrix import matrix_cases
@@ -120,8 +123,8 @@ def test_native_partial_root_and_boundaries(root):
             offset = 5 + camera_index * 11 + (0 if episode['episode_index'] == 7 else 9)
             expected = offset + frames[:2]
             np.testing.assert_allclose(sample['obs'][camera][:, 0, 0, 0] * 255, expected, atol=0.01)
-        expected_state = np.arange(61)[STATE_INDICES] + episode['episode_index'] + frames[:2, None] / 10
-        np.testing.assert_allclose(sample['obs']['state'][:, :25], expected_state, rtol=1e-6)
+        expected_state = extract_state(np.arange(61) + episode['episode_index'] + frames[:2, None] / 10)
+        np.testing.assert_allclose(sample['obs']['state'][:, :23], expected_state, rtol=1e-6)
         assert torch.all(sample['action'][:, 6] == 0)
         # Position n_obs_steps-1 is the current control timestep.
         assert sample['action'][1, 0] == episode['episode_index'] + frames[1]
@@ -184,7 +187,7 @@ def test_hdf5_ingestion_and_default_normalization(root, tmp_path):
             group['obs/head'] = dataset._video.read(dataset.video_path(row, 'head'),
                                                     data['timestamp'] + row[f'videos/{CAMERAS["head"][0]}/from_timestamp'])
     shape_meta = {'action': {'shape': [23]}, 'obs': {
-        'robot_qpos': {'shape': [25], 'type': 'low_dim'},
+        'robot_qpos': {'shape': [23], 'type': 'low_dim'},
         'head': {'shape': [3, 16, 16], 'type': 'rgb'}}}
     upstream = RobomimicReplayImageDataset(shape_meta, str(hdf5_path), horizon=4,
                                           n_obs_steps=2, pad_before=1, pad_after=2)
@@ -192,7 +195,7 @@ def test_hdf5_ingestion_and_default_normalization(root, tmp_path):
     for index in range(len(dataset)):
         native, default = dataset[index], upstream[index]
         torch.testing.assert_close(native['action'], default['action'])
-        torch.testing.assert_close(native['obs']['state'][:, :25], default['obs']['robot_qpos'])
+        torch.testing.assert_close(native['obs']['state'][:, :23], default['obs']['robot_qpos'])
         torch.testing.assert_close(native['obs']['head'], default['obs']['head'], atol=1 / 255, rtol=0)
     normalizer = upstream.get_normalizer()
     action = upstream[0]['action']
@@ -203,24 +206,24 @@ def test_hdf5_ingestion_and_default_normalization(root, tmp_path):
 def test_streaming_limits_match_zarr_and_no_clipping(root):
     dataset = make_dataset(root)
     batches = list(dataset.iter_lowdim(batch_size=3))
-    normalizer = fit_normalizer(iter(batches), dataset.cameras)
+    normalizer = fit_normalizer(iter(batches), dataset.cameras, 23)
     actions = np.concatenate([batch['action'] for batch in batches])
     state = np.concatenate([batch['state'] for batch in batches])
     upstream = LinearNormalizer()
-    upstream.fit({'action': zarr.array(actions), 'state': zarr.array(state[:, :25])}, mode='limits')
+    upstream.fit({'action': zarr.array(actions), 'state': zarr.array(state[:, :23])}, mode='limits')
     for key, values in [('action', actions), ('state', state)]:
         nvalues = normalizer[key].normalize(values)
-        reference = upstream[key].normalize(values if key == 'action' else values[:, :25])
-        torch.testing.assert_close(nvalues if key == 'action' else nvalues[:, :25], reference)
+        reference = upstream[key].normalize(values if key == 'action' else values[:, :23])
+        torch.testing.assert_close(nvalues if key == 'action' else nvalues[:, :23], reference)
         for field in ('min', 'max', 'mean', 'std'):
             actual = normalizer[key].get_input_stats()[field]
             if key == 'state':
-                actual = actual[:25]
+                actual = actual[:23]
             torch.testing.assert_close(actual, upstream[key].get_input_stats()[field], rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(normalizer[key].unnormalize(nvalues), torch.from_numpy(values), rtol=1e-5, atol=1e-5)
     assert torch.all(normalizer['action'].normalize(actions)[:, 6] == 0)
     assert normalizer['action'].normalize(actions + 100).max() > 1
-    torch.testing.assert_close(normalizer['state'].normalize(state)[:, 25:], torch.from_numpy(state[:, 25:]))
+    torch.testing.assert_close(normalizer['state'].normalize(state)[:, 23:], torch.from_numpy(state[:, 23:]))
 
 
 @pytest.mark.parametrize('scheduler', ['ddpm', 'ddim'])
@@ -228,7 +231,7 @@ def test_actual_policy_backward_and_inference(root, scheduler):
     dataset = make_dataset(root, cameras=['head'])
     config = ModelConfig(horizon=4, n_obs_steps=2, n_action_steps=3, cameras=('head',), image_size=16,
                          down_dims=(16, 32), diffusion_step_embed_dim=16, num_train_timesteps=4,
-                         num_inference_steps=2, scheduler=scheduler)
+                         num_inference_steps=2, scheduler=scheduler, gripper_state='sum')
     policy = build_policy(config, dataset.task_map)
     policy.set_normalizer(dataset.get_normalizer())
     sample = dataset[0]
@@ -260,7 +263,7 @@ def test_near_constant_limits():
     values[:, 0] = [7, 7 + 1e-6, 7 + 2e-6]
     values[:, -1] = 1
     actions = values[:, :23].copy()
-    normalizer = fit_normalizer([{'state': values, 'action': actions}], [])
+    normalizer = fit_normalizer([{'state': values, 'action': actions}], [], 25)
     upstream = LinearNormalizer()
     upstream.fit(actions)
     torch.testing.assert_close(normalizer['action'].normalize(actions), upstream.normalize(actions))
@@ -340,7 +343,9 @@ def test_rgb_rgba_padding_and_state_mapping():
     resized = resize_rgb(image, 16)
     assert resized.shape == (16, 16, 3)
     assert not resized[:4].any() and (resized[4:12] == 255).all()
-    np.testing.assert_array_equal(extract_state(np.arange(61)), STATE_INDICES)
+    np.testing.assert_array_equal(extract_state(np.arange(61), 'fingers'), STATE_INDICES)
+    np.testing.assert_array_equal(extract_state(np.arange(61)), np.r_[STATE_INDICES[:14], 24 + 25,
+                                                                      STATE_INDICES[16:23], 49 + 50])
     with pytest.raises(ValueError):
         resize_rgb(image.astype(np.float32), 16)
 
@@ -510,9 +515,9 @@ def test_lowdim_reader_no_video_and_full_horizon(root):
     assert not dataset.cameras
     sample = dataset[2]
     _, frames = dataset.sampler.locate(2)
-    assert isinstance(sample['obs'], torch.Tensor) and sample['obs'].shape == (4, 27)
-    expected = np.arange(61)[STATE_INDICES] + 7 + frames[:, None] / 10
-    np.testing.assert_allclose(sample['obs'][:, :25], expected, rtol=1e-6)
+    assert isinstance(sample['obs'], torch.Tensor) and sample['obs'].shape == (4, 23 + 2)
+    expected = extract_state(np.arange(61) + 7 + frames[:, None] / 10)
+    np.testing.assert_allclose(sample['obs'][:, :23], expected, rtol=1e-6)
     assert set(dataset.get_normalizer().params_dict) == {'obs', 'action'}
     assert not dataset._video.frames and not dataset._video.containers
     assert sample['action'][1, 0] == 7 + frames[1]
@@ -750,7 +755,7 @@ def test_longrun_retention_export_and_resume(root, tmp_path, limit, expected):
     assert full['checkpoint_type'] == 'full' and full['optimizer']['state']
     evaluation = load_checkpoint(queue / 'eval/step-00000004.pt')
     assert set(evaluation) == {'format', 'checkpoint_type', 'config', 'task_map', 'normalizer', 'ema_model', 'step',
-                               'conditioning'}
+                               'conditioning', 'selection'}
     assert evaluation['checkpoint_type'] == 'eval' and evaluation['step'] == 4
     with pytest.raises(ValueError, match='eval-only'):
         train_main(args + ['--max-steps', '6', '--resume', str(queue / 'eval/step-00000004.pt')])
@@ -1177,8 +1182,8 @@ def test_task_onehot_is_optional_off_by_default_in_cli_and_legacy_in_checkpoints
     assert train_parser().parse_args(['--dataset-path', 'x', '--output-dir', 'y']).task_onehot is False
     with_onehot = make_dataset(root, task_names=['alpha'])
     without = make_dataset(root, task_names=['alpha'], task_onehot=False)
-    assert with_onehot[0]['obs']['state'].shape[-1] == 26 and without[0]['obs']['state'].shape[-1] == 25
-    assert without.get_normalizer()['state'].params_dict['scale'].shape == (25,)
+    assert with_onehot[0]['obs']['state'].shape[-1] == 23 + 1 and without[0]['obs']['state'].shape[-1] == 23
+    assert without.get_normalizer()['state'].params_dict['scale'].shape == (23,)
     assert build_policy(ModelConfig(task_onehot=False, **{k: v for k, v in _small_config_dict().items()}),
                         {3: 'alpha'}).obs_encoder is not None
     with pytest.raises(ValueError, match='no task conditioning'):
@@ -1192,6 +1197,7 @@ def test_task_onehot_is_optional_off_by_default_in_cli_and_legacy_in_checkpoints
                 *_small_transformer_flags(task_onehot=False)])
     policy, checkpoint = load_policy(output)
     assert checkpoint['config']['task_onehot'] is False
+    # config_flags passes the matrix case's gripper_state, the dataclass default `fingers`
     assert policy.normalizer['state'].params_dict['scale'].shape == (25,)
     session = B1KPolicySession(policy, checkpoint['config'], checkpoint['task_map'])
     actions = session.act(observation(0.5, task=3))
@@ -1299,3 +1305,342 @@ def test_grad_accumulation_keeps_the_step_batch_resumes_exactly_and_is_recorded(
         train_main(args + ['--output-dir', str(tmp_path / 'bad'), '--max-steps', '1', '--batch-size', '3'])
     with pytest.raises(ValueError, match='divide the micro-batch'):
         train_main(args + ['--output-dir', str(tmp_path / 'bad2'), '--max-steps', '1', '--loader-batch-size', '3'])
+
+
+def add_episode(root, episode, task, length=6, file_index=0):
+    """Append an episode showing frames 30.. of the fixture videos; its data rows are written only for file 0."""
+    meta_path, data_path = root / 'meta/episodes/chunk-004/file-000.parquet', root / 'data/chunk-004/file-000.parquet'
+    metadata, frames = pq.read_table(meta_path), pq.read_table(data_path)
+    start = 1000 + frames.num_rows
+    row = {'episode_index': episode, 'task_index': task, 'length': length, 'data/chunk_index': 4,
+           'data/file_index': file_index, 'dataset_from_index': start, 'dataset_to_index': start + length}
+    for camera in CAMERAS:
+        key = CAMERAS[camera][0]
+        row.update({f'videos/{key}/chunk_index': 4, f'videos/{key}/file_index': 0,
+                    f'videos/{key}/from_timestamp': 3.0, f'videos/{key}/to_timestamp': 3.0 + length / 10})
+    pq.write_table(pa.concat_tables([metadata, pa.Table.from_pylist([row], schema=metadata.schema)]), meta_path)
+    if file_index == 0:
+        rows = [{'observation.state': (np.arange(61, dtype=np.float32) + episode + index / 10).tolist(),
+                 'action': (np.arange(23, dtype=np.float32) + episode + index).tolist(), 'episode_index': episode,
+                 'task_index': task, 'frame_index': index, 'timestamp': index / 10, 'index': start + index}
+                for index in range(length)]
+        pq.write_table(pa.concat_tables([frames, pa.Table.from_pylist(rows, schema=frames.schema)]), data_path,
+                       row_group_size=6)
+
+
+def write_split(path, train, name='unit'):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'format': 'isg-episode-split/v1', 'name': name, 'tasks': {
+        task: {'train': episodes, 'held_out': []} for task, episodes in train.items()}}))
+    return path
+
+
+def test_episode_split_resolution_and_exact_dataset_selection(root, tmp_path):
+    assert resolve_episode_split(root) is None  # auto without isg_meta/train_split.json: every episode, as before
+    add_episode(root, 50, 3)
+    default = write_split(root / 'isg_meta/train_split.json', {'alpha': [7], 'beta': [42]})
+    split = resolve_episode_split(root)
+    assert split == {'file': str(default), 'sha256': hashlib.sha256(default.read_bytes()).hexdigest(),
+                     'format': 'isg-episode-split/v1', 'name': 'unit', 'subset': 'train', 'tasks': ['alpha', 'beta'],
+                     'episodes': [7, 42]}
+    assert resolve_episode_split(root, 'none') is None
+    assert resolve_episode_split(root, task_names=['beta'])['episodes'] == [42]
+    other = write_split(tmp_path / 'other.json', {'alpha': [50, 7]}, name='other')
+    explicit = resolve_episode_split(root, str(other))
+    assert explicit['file'] == str(other) and explicit['tasks'] == ['alpha'] and explicit['episodes'] == [7, 50]
+    with pytest.raises(FileNotFoundError, match='not found'):
+        resolve_episode_split(root, str(tmp_path / 'missing.json'))
+    with pytest.raises(ValueError, match=r"\['beta'\] have no entry in episode split .*other\.json"):
+        resolve_episode_split(root, str(other), ['alpha', 'beta'])
+    (tmp_path / 'v0.json').write_text(json.dumps({'format': 'isg-episode-split/v0', 'tasks': {}}))
+    with pytest.raises(ValueError, match='not an isg-episode-split/v1'):
+        resolve_episode_split(root, str(tmp_path / 'v0.json'))
+    everything = make_dataset(root)
+    selected = make_dataset(root, task_names=split['tasks'], episodes=split['episodes'])
+    assert [row['episode_index'] for row in everything.episodes] == [7, 42, 50]
+    assert [row['episode_index'] for row in selected.episodes] == [7, 42] and selected.task_map == everything.task_map
+    assert selected.fingerprint() != everything.fingerprint()
+    assert [row['episode_index'] for row in make_dataset(root, episodes=[50, 7, 42], max_episodes=2).episodes] == [7, 42]
+    with pytest.raises(ValueError, match="episode 42 belongs to task 'beta', which is not selected"):
+        make_dataset(root, task_names=['alpha'], episodes=[7, 42])
+    with pytest.raises(ValueError, match=r'\[99\] are not in the local episode metadata'):
+        make_dataset(root, episodes=[7, 99])
+    add_episode(root, 51, 3, file_index=1)
+    assert [row['episode_index'] for row in make_dataset(root).episodes] == [7, 42, 50]  # partial root: skipped
+    with pytest.raises(FileNotFoundError, match='Selected episode 51'):
+        make_dataset(root, episodes=[7, 51])  # ... but a requested episode is never dropped
+
+
+def test_train_records_episode_split_and_resume_keeps_the_checkpoint_selection(root, tmp_path, capsys):
+    from diffusion_policy.b1k.model import load_checkpoint
+    add_episode(root, 50, 3)
+    split_file = write_split(root / 'isg_meta/train_split.json', {'alpha': [7], 'beta': [42]})
+    expected = {'file': str(split_file), 'sha256': hashlib.sha256(split_file.read_bytes()).hexdigest(),
+                'format': 'isg-episode-split/v1', 'name': 'unit', 'subset': 'train', 'tasks': ['alpha', 'beta'],
+                'episodes': [7, 42]}
+    run, unsplit = tmp_path / 'run', tmp_path / 'unsplit'
+    train_main(longrun_args(root, run) + ['--max-steps', '1', '--export-every', '1'])
+    logged = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"episode_split"')]
+    assert logged == [{'episode_split': {'name': 'unit', 'file': str(split_file), 'episodes': 2, 'tasks': ['alpha', 'beta']}}]
+    checkpoint = load_checkpoint(run)
+    assert checkpoint['selection'] == {'task_names': ['alpha', 'beta'], 'max_episodes': None,
+                                       'episode_indices': [7, 42], 'episode_split': expected, 'settle_steps': None}
+    assert load_checkpoint(run / 'export_queue/eval/step-00000001.pt')['selection'] == checkpoint['selection']
+    config = json.loads((run / 'config.json').read_text())
+    assert config['training']['episode_split'] == expected and config['conditioning']['data_split'] == 'train'
+    train_main(longrun_args(root, unsplit) + ['--max-steps', '1', '--episode-split', 'none'])
+    assert load_checkpoint(unsplit)['selection']['episode_indices'] == [7, 42, 50]
+    assert load_checkpoint(unsplit)['selection']['episode_split'] is None
+    # Resume: the checkpoint's selection is authoritative, even after the split file changed.
+    copy_file = tmp_path / 'copy.json'
+    copy_file.write_bytes(split_file.read_bytes())
+    write_split(split_file, {'alpha': [7, 50], 'beta': [42]})
+    for flags in (['--episode-split', 'auto'], ['--episode-split', 'none'], ['--episode-split', str(split_file)]):
+        with pytest.raises(ValueError, match='--episode-split selects other episodes'):
+            train_main(longrun_args(root, run) + ['--max-steps', '2', '--resume', str(run), *flags])
+    train_main(longrun_args(root, run) + ['--max-steps', '2', '--resume', str(run)])
+    train_main(longrun_args(root, run) + ['--max-steps', '3', '--resume', str(run), '--episode-split', str(copy_file)])
+    resumed = load_checkpoint(run)
+    assert resumed['step'] == 3 and resumed['selection'] == checkpoint['selection']
+    # Checkpoints without a split, or written before the option existed, resume without auto-discovery.
+    legacy = torch.load(unsplit / 'step-00000001.pt', weights_only=True)
+    del legacy['selection']['episode_split']
+    torch.save(legacy, unsplit / 'step-00000001.pt')
+    train_main(longrun_args(root, unsplit) + ['--max-steps', '2', '--resume', str(unsplit)])
+    assert load_checkpoint(unsplit)['selection']['episode_indices'] == [7, 42, 50]
+    assert load_checkpoint(unsplit)['selection']['episode_split'] is None
+
+
+def write_groups(root, groups, format='isg-task-groups/v1'):
+    path = root / 'isg_meta/task_groups.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'format': format, 'groups': groups}))
+    return path
+
+
+def test_task_groups_expand_to_the_tasks_they_reach(root):
+    assert expand_task_groups(root, None) is None
+    assert expand_task_groups(root, ['beta', 'typo']) == ['beta', 'typo']  # no group file: unchanged
+    write_groups(root, {'alphas': ['alpha'], 'pair': ['alphas', 'beta'], 'all': ['pair', 'absent']})
+    assert expand_task_groups(root, 'alphas') == ['alpha']
+    assert expand_task_groups(root, ['all']) == ['alpha', 'beta', 'absent']
+    assert expand_task_groups(root, ['beta', 'pair', 'alpha']) == ['beta', 'alpha']
+    with pytest.raises(ValueError, match=r"Unknown task or task group 'typo'; groups in .*task_groups\.json: "
+                                         r"\['all', 'alphas', 'pair'\]"):
+        expand_task_groups(root, ['alpha', 'typo'])
+    for groups, error in [({'outer': ['inner'], 'inner': ['alfa']},
+                           r"Task group 'inner' in .* lists unknown task or group 'alfa'"),
+                          ({'outer': ['inner'], 'inner': ['outer']}, 'Task group cycle outer -> inner -> outer'),
+                          ({'outer': ['alpha'], 'alpha': ['beta']}, "'alpha' is both a task and a task group"),
+                          ({'outer': []}, "Task group 'outer' .* must be a nonempty list"),
+                          ({'outer': 'alpha'}, "Task group 'outer' .* must be a nonempty list")]:
+        write_groups(root, groups)
+        with pytest.raises(ValueError, match=error):
+            expand_task_groups(root, ['outer'])
+        assert expand_task_groups(root, ['beta']) == ['beta']  # only the groups reached are checked
+    write_groups(root, {}, format='isg-task-groups/v0')
+    with pytest.raises(ValueError, match='not an isg-task-groups/v1 task group file'):
+        expand_task_groups(root, ['alpha'])
+
+
+def test_train_on_a_task_group_uses_its_split_episodes_and_their_normalizer(root, tmp_path, capsys):
+    from diffusion_policy.b1k.model import load_checkpoint
+    add_episode(root, 50, 3)
+    write_split(root / 'isg_meta/train_split.json', {'alpha': [50], 'beta': [42]})
+    write_groups(root, {'alphas': ['alpha'], 'pair': ['alphas', 'beta']})
+    run = tmp_path / 'run'
+    train_main(longrun_args(root, run) + ['--max-steps', '1', '--task-names', 'alphas'])
+    logged = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"task_groups"')]
+    assert logged == [{'task_groups': {'requested': ['alphas'], 'tasks': ['alpha']}}]
+    checkpoint = load_checkpoint(run)
+    assert checkpoint['selection']['task_names'] == ['alpha'] and checkpoint['selection']['episode_indices'] == [50]
+    assert checkpoint['selection']['episode_split']['tasks'] == ['alpha']
+    config = json.loads((run / 'config.json').read_text())
+    assert config['training']['requested_task_names'] == ['alphas'] and config['training']['task_names'] == ['alpha']
+    # The normalizer is fitted on the group's split episodes alone: episode 50, not episode 7 of the same task.
+    expected = make_dataset(root, task_names=['alpha'], episodes=[50], observation_mode='lowdim').get_normalizer()
+    whole_task = make_dataset(root, task_names=['alpha'], observation_mode='lowdim').get_normalizer()
+    saved = {key.split('normalizer.', 1)[1]: value for key, value in checkpoint['model'].items()
+             if 'normalizer.' in key}
+    assert saved.keys() == expected.state_dict().keys()
+    assert all(torch.equal(saved[key], value) for key, value in expected.state_dict().items())
+    assert not all(torch.equal(saved[key], value) for key, value in whole_task.state_dict().items())
+    train_main(longrun_args(root, tmp_path / 'mixed') + ['--max-steps', '1', '--task-names', 'beta', 'pair'])
+    assert load_checkpoint(tmp_path / 'mixed')['selection']['episode_indices'] == [42, 50]
+    # Resume expands --task-names again and must arrive at the checkpoint's tasks.
+    train_main(longrun_args(root, run) + ['--max-steps', '2', '--resume', str(run), '--task-names', 'alphas'])
+    assert load_checkpoint(run)['step'] == 2
+    write_groups(root, {'alphas': ['alpha', 'beta']})
+    with pytest.raises(ValueError, match=r"--task-names \['alphas'\] select \['alpha', 'beta'\], but the checkpoint "
+                                         r"trained on \['alpha'\]"):
+        train_main(longrun_args(root, run) + ['--max-steps', '3', '--resume', str(run), '--task-names', 'alphas'])
+
+
+def test_frame_cache_builder_accepts_task_groups(root, tmp_path, monkeypatch):
+    from diffusion_policy.b1k import frame_cache
+    add_episode(root, 50, 3, length=12)  # long enough for the builder's default horizon
+    write_groups(root, {'alphas': ['alpha']})
+    built = []
+    monkeypatch.setattr(frame_cache, 'build_frame_cache', lambda dataset, *args, **kwargs: built.append(
+        dict(dataset.task_map)))
+    frame_cache.main(['--dataset-path', str(root), '--cache-dir', str(tmp_path / 'cache'), '--task-names', 'alphas',
+                      '--image-size', '16', '--verify', '0'])
+    assert built == [{3: 'alpha'}]
+
+
+def write_settle_windows(root, programs, format='isg-settle-windows/v1'):
+    lengths = dict(zip(*pq.read_table(root / 'meta/episodes/chunk-004/file-000.parquet',
+                                      columns=['episode_index', 'length']).to_pydict().values()))
+    path = root / 'isg_meta/settle_windows.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'format': format, 'episodes': {
+        str(episode): {'length': lengths[episode], 'program_length': program} for episode, program in programs.items()}}))
+    return path
+
+
+def truncated_copy(root, destination, programs):
+    """The physical cut at the program end that --settle-steps 0 replaces (what truncate-isg-settle.py writes)."""
+    shutil.copytree(root, destination)
+    data = destination / 'data/chunk-004/file-000.parquet'
+    frames = pq.read_table(data)
+    keep = [index < programs[episode] for episode, index in zip(frames['episode_index'].to_pylist(),
+                                                               frames['frame_index'].to_pylist())]
+    pq.write_table(frames.filter(pa.array(keep)), data, row_group_size=6)
+    meta = destination / 'meta/episodes/chunk-004/file-000.parquet'
+    metadata = pq.read_table(meta)
+    rows = [{**row, 'length': programs[row['episode_index']],
+             'dataset_to_index': row['dataset_from_index'] + programs[row['episode_index']]} for row in metadata.to_pylist()]
+    pq.write_table(pa.Table.from_pylist(rows, schema=metadata.schema), meta)
+    return destination
+
+
+def test_settle_steps_specs_are_canonical_and_fractions_exact():
+    for spec, canonical in [('all', 'all'), ('0', '0'), ('010', '10'), (10, '10'), ('0.20', '0.2'), ('.5', '0.5'),
+                            ('1.', '1.0'), ('1.0', '1.0'), ('10.0', '10.0'), ('0.0', '0.0'), (' 0.1 ', '0.1')]:
+        assert parse_settle_steps(spec) == canonical
+    for spec in ('-1', '1e-1', '0.2%', 'half', '', '.', 'none'):
+        with pytest.raises(ValueError, match='--settle-steps must be all, a number of frames'):
+            parse_settle_steps(spec)
+    assert settle_frames('0.55', 100) == 55  # math.ceil(0.55 * 100) is 56 in floating point
+    assert settle_frames('0.2', 7) == 2 and settle_frames('1.0', 7) == 7 and settle_frames('1', 7) == 1
+
+
+def test_settle_steps_cut_episodes_at_load_time_like_a_truncated_copy(root, tmp_path, capsys):
+    everything = make_dataset(root, goal_views=('head',))
+    with pytest.raises(FileNotFoundError, match=r'--settle-steps 0 needs .*isg_meta/settle_windows\.json'):
+        make_dataset(root, settle_steps='0')
+    path = write_settle_windows(root, {7: 3, 42: 5})
+    assert make_dataset(root, settle_steps='all').fingerprint() == everything.fingerprint()
+    capsys.readouterr()
+    settled = make_dataset(root, goal_views=('head',), settle_steps='0')
+    expected = {'spec': '0', 'file': str(path.resolve()), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                'format': 'isg-settle-windows/v1', 'frames': 8, 'settle_frames': 0, 'recorded_frames': 13,
+                'capped_episodes': 0}
+    assert settled.settle == expected
+    assert [json.loads(line) for line in capsys.readouterr().out.splitlines()
+            if line.startswith('{"settle_steps"')] == [{'settle_steps': expected}]
+    assert [row['length'] for row in settled.episodes] == [3, 5] and settled.fingerprint() != everything.fingerprint()
+    # Everything matches cutting the files at the program end, except the goal: still the last recorded frame.
+    copy = make_dataset(truncated_copy(root, tmp_path / 'truncated', {7: 3, 42: 5}), goal_views=('head',))
+    assert len(settled) == len(copy) == 8
+    goal = goal_key('head')
+    for index in range(len(copy)):
+        ours, theirs = settled[index], copy[index]
+        assert torch.equal(ours['action'], theirs['action']) and ours['obs'].keys() == theirs['obs'].keys()
+        assert all(torch.equal(ours['obs'][key], theirs['obs'][key]) for key in ours['obs'] if key != goal)
+    np.testing.assert_array_equal(settled.goal_table, everything.goal_table)
+    assert not np.array_equal(settled.goal_table, copy.goal_table)
+    lowdim = {'observation_mode': 'lowdim'}
+    ours = make_dataset(root, settle_steps='0', **lowdim).get_normalizer().state_dict()
+    theirs = make_dataset(tmp_path / 'truncated', **lowdim).get_normalizer().state_dict()
+    assert ours.keys() == theirs.keys() and all(torch.equal(ours[key], theirs[key]) for key in ours)
+    assert not all(torch.equal(ours[key], value)
+                   for key, value in make_dataset(root, **lowdim).get_normalizer().state_dict().items())
+    # Fractions round up; requests beyond an episode's recorded window keep the whole window.
+    for spec, lengths, capped in [('1', [4, 6], 0), ('0.4', [5, 7], 0), ('3', [5, 8], 1), ('10', [5, 8], 2)]:
+        dataset = make_dataset(root, settle_steps=spec)
+        assert [row['length'] for row in dataset.episodes] == lengths and dataset.settle['capped_episodes'] == capped
+    assert dataset.fingerprint() == make_dataset(root).fingerprint()  # every recorded frame
+    assert [row['length'] for row in make_dataset(root, task_names=['beta'], settle_steps='0').episodes] == [5]
+    write_settle_windows(root, {7: 3})
+    with pytest.raises(ValueError, match=r'has no settle window for episode 42 of length 8 \(entry None\)'):
+        make_dataset(root, settle_steps='0')
+    assert len(make_dataset(root, task_names=['alpha'], settle_steps='0').episodes) == 1
+    path.write_text(json.dumps({'format': 'isg-settle-windows/v1', 'episodes': {
+        '7': {'length': 6, 'program_length': 3}, '42': {'length': 8, 'program_length': 5}}}))
+    with pytest.raises(ValueError, match=r'episode 7 of length 5 .*regenerate it for this dataset'):
+        make_dataset(root, settle_steps='0')
+    write_settle_windows(root, {7: 3, 42: 5}, format='isg-settle-windows/v0')
+    with pytest.raises(ValueError, match='not an isg-settle-windows/v1 file'):
+        make_dataset(root, settle_steps='0')
+
+
+def test_train_records_settle_steps_and_resume_keeps_the_checkpoint_value(root, tmp_path):
+    from diffusion_policy.b1k.model import load_checkpoint
+    with pytest.raises(FileNotFoundError, match='settle_windows.json'):
+        train_main(longrun_args(root, tmp_path / 'missing') + ['--max-steps', '1', '--settle-steps', '0'])
+    with pytest.raises(ValueError, match='--settle-steps must be all'):
+        train_main(longrun_args(root, tmp_path / 'typo') + ['--max-steps', '1', '--settle-steps', '20%'])
+    write_settle_windows(root, {7: 3, 42: 5})
+    expected = make_dataset(root, settle_steps='0').settle
+    run, plain = tmp_path / 'run', tmp_path / 'plain'
+    train_main(longrun_args(root, run) + ['--max-steps', '1', '--export-every', '1', '--settle-steps', '00'])
+    checkpoint = load_checkpoint(run)
+    assert checkpoint['selection']['settle_steps'] == expected and checkpoint['conditioning']['settle_steps'] == '0'
+    assert load_checkpoint(run / 'export_queue/eval/step-00000001.pt')['selection'] == checkpoint['selection']
+    config = json.loads((run / 'config.json').read_text())
+    assert config['settle_steps'] == expected and config['training']['settle_steps'] == '0'
+    assert config['conditioning']['settle_steps'] == '0'
+    normalizer = make_dataset(root, settle_steps='0', observation_mode='lowdim').get_normalizer().state_dict()
+    saved = {key.split('normalizer.', 1)[1]: value for key, value in checkpoint['model'].items() if 'normalizer.' in key}
+    assert saved.keys() == normalizer.keys() and all(torch.equal(saved[key], value) for key, value in normalizer.items())
+    train_main(longrun_args(root, plain) + ['--max-steps', '1'])
+    assert load_checkpoint(plain)['selection']['settle_steps'] is None
+    assert json.loads((plain / 'config.json').read_text())['conditioning']['settle_steps'] == 'all'
+    # Resume keeps the checkpoint's value; an explicit value must be the same one.
+    for spec in ('all', '1', '0.0'):
+        with pytest.raises(ValueError, match=rf'--settle-steps {spec} conflicts with the resumed checkpoint \(0\)'):
+            train_main(longrun_args(root, run) + ['--max-steps', '2', '--resume', str(run), '--settle-steps', spec])
+    train_main(longrun_args(root, run) + ['--max-steps', '2', '--resume', str(run)])
+    train_main(longrun_args(root, run) + ['--max-steps', '3', '--resume', str(run), '--settle-steps', '0'])
+    resumed = load_checkpoint(run)
+    assert resumed['step'] == 3 and resumed['selection'] == checkpoint['selection']
+    # Checkpoints from before the option resume on every recorded frame.
+    legacy = torch.load(plain / 'step-00000001.pt', weights_only=True)
+    del legacy['selection']['settle_steps']
+    torch.save(legacy, plain / 'step-00000001.pt')
+    with pytest.raises(ValueError, match=r'--settle-steps 0 conflicts with the resumed checkpoint \(all\)'):
+        train_main(longrun_args(root, plain) + ['--max-steps', '2', '--resume', str(plain), '--settle-steps', '0'])
+    train_main(longrun_args(root, plain) + ['--max-steps', '2', '--resume', str(plain)])
+    assert load_checkpoint(plain)['selection']['settle_steps'] is None
+def test_gripper_state_is_recorded_and_legacy_checkpoints_resume_and_serve(root, tmp_path):
+    from diffusion_policy.b1k.model import load_checkpoint
+    run, fingers = tmp_path / 'sum', tmp_path / 'fingers'
+    train_main(longrun_args(root, run) + ['--max-steps', '1'])
+    policy, summed = load_policy(run)
+    assert summed['config']['gripper_state'] == 'sum' and policy.normalizer['obs'].params_dict['scale'].shape == (23 + 2,)
+    assert json.loads((run / 'config.json').read_text())['training']['gripper_state'] == 'sum'
+    train_main(longrun_args(root, fingers) + ['--max-steps', '1', '--gripper-state', 'fingers'])
+    assert load_checkpoint(fingers)['config']['gripper_state'] == 'fingers'
+    # A checkpoint from before the option (no recorded layout) resumes and serves with both finger positions.
+    legacy = torch.load(fingers / 'step-00000001.pt', weights_only=True)
+    del legacy['config']['gripper_state']
+    torch.save(legacy, fingers / 'step-00000001.pt')
+    assert ModelConfig(**legacy['config']).gripper_state == 'fingers'
+    with pytest.raises(ValueError, match=r'--gripper-state sum conflicts with the resumed checkpoint \(fingers\)'):
+        train_main(longrun_args(root, fingers) + ['--max-steps', '2', '--resume', str(fingers), '--gripper-state', 'sum'])
+    train_main(longrun_args(root, fingers) + ['--max-steps', '2', '--resume', str(fingers)])
+    resumed_policy, resumed = load_policy(fingers)
+    assert resumed['step'] == 2 and resumed_policy.normalizer['obs'].params_dict['scale'].shape == (25 + 2,)
+    for model, checkpoint in ((policy, summed), (resumed_policy, resumed)):
+        assert B1KPolicySession(model, checkpoint['config'], checkpoint['task_map']).act(observation(1)).shape == (1, 23)
+    # `fingers` keeps the dataset fingerprint of runs from before the option; `sum` gets its own.
+    dataset = make_dataset(root, gripper_state='fingers')
+    paths = {dataset.data_path(row) for row in dataset.episodes}
+    paths.update(dataset.video_path(row, camera) for row in dataset.episodes for camera in dataset.cameras)
+    files = [(str(path.relative_to(dataset.root)), path.stat().st_size, path.stat().st_mtime_ns) for path in sorted(paths)]
+    payload = {'info': dataset.info, 'episodes': dataset.episodes, 'tasks': dataset.task_map, 'files': files}
+    assert dataset.fingerprint() == hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    assert make_dataset(root).fingerprint() != dataset.fingerprint()
+    with pytest.raises(ValueError, match="Unknown gripper_state 'both'"):
+        make_dataset(root, gripper_state='both')

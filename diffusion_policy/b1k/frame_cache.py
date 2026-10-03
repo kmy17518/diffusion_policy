@@ -242,7 +242,8 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     result.add_argument('--dataset-path', '--dataset-root', dest='dataset_path', required=True)
     result.add_argument('--cache-dir', required=True)
-    result.add_argument('--task-names', nargs='+')
+    result.add_argument('--task-names', nargs='+',
+                        help='Tasks or task groups of <dataset>/isg_meta/task_groups.json (default: every local task)')
     result.add_argument('--cameras', choices=list(CAMERAS), nargs='+', default=list(CAMERAS))
     result.add_argument('--image-size', type=int, default=96)
     result.add_argument('--max-episodes', type=int)
@@ -254,9 +255,10 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    from diffusion_policy.b1k.dataset import B1KLeRobotDataset
-    dataset = B1KLeRobotDataset(args.dataset_path, args.task_names, cameras=tuple(args.cameras),
-                                image_size=args.image_size, max_episodes=args.max_episodes)
+    from diffusion_policy.b1k.dataset import B1KLeRobotDataset, expand_task_groups
+    dataset = B1KLeRobotDataset(args.dataset_path, expand_task_groups(args.dataset_path, args.task_names),
+                                cameras=tuple(args.cameras), image_size=args.image_size,
+                                max_episodes=args.max_episodes)
     try:
         build_frame_cache(dataset, args.cache_dir, workers=args.workers)
         if args.verify:
