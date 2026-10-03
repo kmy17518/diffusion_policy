@@ -6,7 +6,7 @@ import importlib
 import torch
 from diffusers import DDIMScheduler, DDPMScheduler
 
-from diffusion_policy.b1k.robot import CAMERAS, goal_key
+from diffusion_policy.b1k.robot import CAMERAS, GRIPPER_STATES, goal_key, proprio_dim
 from diffusion_policy.b1k.dataset import GOAL_SOURCES
 
 
@@ -60,7 +60,7 @@ class ModelConfig:
     freeze_encoder: bool = False
     language_conditioning: str = 'none'
     prompt_source: str = 'task_name'
-    # Append the one-hot task id to the 25-D state. True is the v1 behavior and therefore the dataclass
+    # Append the one-hot task id to the proprioceptive state. True is the v1 behavior and therefore the dataclass
     # default (checkpoints without the field keep it); the trainer CLI defaults to --no-task-onehot.
     task_onehot: bool = True
     # Conditioning regime declared for the run (none | language | image | image_language; None = not declared) and
@@ -73,6 +73,9 @@ class ModelConfig:
     goal_source: str = 'episode_last'
     goal_encoder: str = 'shared_base'
     language_on_goal_encoder: bool = False
+    # Gripper proprioception layout (robot.GRIPPER_STATES). `fingers` (25 values) is the layout of checkpoints that
+    # do not record it and therefore the dataclass default; the trainer CLI defaults to `sum` (23 values).
+    gripper_state: str = 'fingers'
 
     @property
     def lowdim(self):
@@ -90,7 +93,7 @@ class ModelConfig:
                 'obs_steps': self.obs_steps, 'imagenet_norm': self.imagenet_norm,
                 'language_conditioning': self.language_conditioning, 'prompt_source': self.prompt_source,
                 'task_onehot': self.task_onehot, 'goal_views': self.goal_views if self.goal_fusion != 'none' else (),
-                'goal_source': self.goal_source}
+                'goal_source': self.goal_source, 'gripper_state': self.gripper_state}
 
     def to_dict(self):
         return asdict(self)
@@ -103,6 +106,8 @@ class ModelConfig:
     def validate(self):
         if self.variant not in POLICY_TARGETS:
             raise ValueError(f'Unknown diffusion variant {self.variant!r}')
+        if self.gripper_state not in GRIPPER_STATES:
+            raise ValueError(f'gripper_state must be one of {GRIPPER_STATES}')
         if self.regime not in (None, 'none', 'language', 'image', 'image_language'):
             raise ValueError(f'Unknown regime {self.regime!r}')
         if self.goal_fusion not in ('none', 'early', 'late') or self.goal_encoder not in ('shared_base', 'separate_base'):
@@ -235,7 +240,7 @@ def build_policy(config, task_map, initialize_encoder=True):
         # Regime N deliberately trains several tasks with no task signal; anything else must say what conditions it.
         raise ValueError('Several tasks but no task conditioning: enable task_onehot, language or goal conditioning, '
                          'or declare --regime none for the observation-only condition')
-    obs_dim = 25 + (len(task_map) if config.task_onehot else 0)
+    obs_dim = proprio_dim(config.gripper_state) + (len(task_map) if config.task_onehot else 0)
     if config.lowdim:
         common.update(obs_dim=obs_dim, action_dim=23, pred_action_steps_only=config.pred_action_steps_only)
         input_dim = 23 + (obs_dim if config.conditioning == 'inpainting' else 0)

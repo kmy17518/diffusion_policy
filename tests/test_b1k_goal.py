@@ -74,7 +74,7 @@ def test_dataset_goal_table_is_the_episode_last_frame(root):
     item = dataset[len(dataset) - 1]  # a sequence of episode 42
     assert item['obs']['goal_head'].shape == (3, 16, 16) and item['obs']['goal_head'].dtype == torch.uint8
     assert int(item['obs']['goal_head'][0, 0, 0]) == 21 and int(item['obs']['goal_right_wrist'][0, 0, 0]) == 43
-    assert item['obs']['head'].shape == (2, 3, 16, 16) and item['obs']['state'].shape == (2, 25)
+    assert item['obs']['head'].shape == (2, 3, 16, 16) and item['obs']['state'].shape == (2, 23)
     normalizer = dataset.get_normalizer()
     assert 'goal_head' in normalizer.params_dict and 'goal_right_wrist' in normalizer.params_dict
     normalized = normalizer.normalize({'goal_head': item['obs']['goal_head'][None].float() / 255})
@@ -220,7 +220,7 @@ def test_late_fusion_policy_encodes_the_goal_once_per_sample_and_is_goal_sensiti
     policy = build_policy(config, TASKS)
     from diffusion_policy.b1k.normalization import fit_normalizer
     normalizer = fit_normalizer([{'state': np.random.randn(50, 25).astype(np.float32),
-                                  'action': np.random.randn(50, 23).astype(np.float32)}], config.cameras)
+                                  'action': np.random.randn(50, 23).astype(np.float32)}], config.cameras, 25)
     normalizer['goal_head'] = normalizer['head']
     policy.set_normalizer(normalizer)
     obs = observations(config)
