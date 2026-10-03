@@ -6,7 +6,7 @@ import importlib
 import torch
 from diffusers import DDIMScheduler, DDPMScheduler
 
-from diffusion_policy.b1k.robot import CAMERAS
+from diffusion_policy.b1k.robot import CAMERAS, GRIPPER_STATES, proprio_dim
 
 
 POLICY_TARGETS = {
@@ -57,6 +57,9 @@ class ModelConfig:
     imagenet_norm: bool = False
     encoder_weights: str | None = None
     freeze_encoder: bool = False
+    # Gripper proprioception layout (robot.GRIPPER_STATES). `fingers` (25 values) is the layout of checkpoints that
+    # do not record it and therefore the dataclass default; the trainer CLI defaults to `sum` (23 values).
+    gripper_state: str = 'fingers'
 
     @property
     def lowdim(self):
@@ -71,7 +74,8 @@ class ModelConfig:
                 'n_action_steps': self.n_action_steps,
                 'cameras': () if self.lowdim else self.cameras, 'image_size': self.image_size,
                 'observation_mode': 'lowdim' if self.lowdim else 'image',
-                'obs_steps': self.obs_steps, 'imagenet_norm': self.imagenet_norm}
+                'obs_steps': self.obs_steps, 'imagenet_norm': self.imagenet_norm,
+                'gripper_state': self.gripper_state}
 
     def to_dict(self):
         return asdict(self)
@@ -79,6 +83,8 @@ class ModelConfig:
     def validate(self):
         if self.variant not in POLICY_TARGETS:
             raise ValueError(f'Unknown diffusion variant {self.variant!r}')
+        if self.gripper_state not in GRIPPER_STATES:
+            raise ValueError(f'gripper_state must be one of {GRIPPER_STATES}')
         if self.conditioning not in ('global', 'local', 'inpainting'):
             raise ValueError('conditioning must be global, local or inpainting')
         if self.conditioning == 'local' and self.variant != 'unet_lowdim':
@@ -167,7 +173,7 @@ def build_policy(config, task_map, initialize_encoder=True):
     transformer = {key: getattr(config, key) for key in (
         'n_layer', 'n_head', 'n_emb', 'n_cond_layers', 'p_drop_emb', 'p_drop_attn', 'causal_attn', 'time_as_cond')}
     global_cond = config.conditioning == 'global'
-    obs_dim = 25 + len(task_map)
+    obs_dim = proprio_dim(config.gripper_state) + len(task_map)
     if config.lowdim:
         common.update(obs_dim=obs_dim, action_dim=23, pred_action_steps_only=config.pred_action_steps_only)
         input_dim = 23 + (obs_dim if config.conditioning == 'inpainting' else 0)

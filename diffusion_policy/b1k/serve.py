@@ -88,7 +88,7 @@ class B1KPolicySession:
             raise ValueError('proprio must have shape (61,) or (B,61)')
         batch_size = len(state)
         ids = self._tasks(obs, batch_size)
-        state = condition_state(extract_state(state), np.asarray(ids), self.task_map)
+        state = condition_state(extract_state(state, self.model_config.gripper_state), np.asarray(ids), self.task_map)
         current = {'state': state}
         for camera in (() if self.model_config.lowdim else self.config['cameras']):
             images = np.asarray(obs[CAMERAS[camera][1]])

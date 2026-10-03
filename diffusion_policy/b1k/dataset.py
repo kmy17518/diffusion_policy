@@ -18,7 +18,7 @@ import pyarrow.parquet as pq
 import torch
 
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
-from diffusion_policy.b1k.robot import CAMERAS, condition_state, extract_state, resize_rgb
+from diffusion_policy.b1k.robot import CAMERAS, GRIPPER_STATES, condition_state, extract_state, proprio_dim, resize_rgb
 
 EPISODE_SPLIT_FORMAT = 'isg-episode-split/v1'
 DEFAULT_EPISODE_SPLIT = 'isg_meta/train_split.json'
@@ -287,7 +287,7 @@ class B1KLeRobotDataset(BaseImageDataset):
                  pad_before=None, pad_after=None, episode_cache_size=8,
                  parquet_cache_mb=256, max_episodes=None, observation_mode='image',
                  obs_steps=None, imagenet_norm=False, image_dtype='float32',
-                 frame_cache=None, video_max_open=32, episodes=None, settle_steps='all'):
+                 frame_cache=None, video_max_open=32, episodes=None, settle_steps='all', gripper_state='sum'):
         """
         episodes (episode split, see `resolve_episode_split`): episode_index values to load, applied after the task
         filter and before `max_episodes`. Each must be present locally with all files it needs and belong to a
@@ -297,7 +297,12 @@ class B1KLeRobotDataset(BaseImageDataset):
         settle_steps (see `apply_settle_steps`): cut every episode after its program plus that many settle frames
         without rewriting the dataset. Sequences (edge-padded at the cut), the normalizer statistics of
         `iter_lowdim` and the fingerprint cover the kept frames only.
+
+        gripper_state (see robot.GRIPPER_STATES): proprioception layout of the state and of the normalizer.
         """
+        if gripper_state not in GRIPPER_STATES:
+            raise ValueError(f'Unknown gripper_state {gripper_state!r}; expected one of {GRIPPER_STATES}')
+        self.gripper_state = gripper_state
         self.root = Path(dataset_path).resolve()
         self.info = json.loads((self.root / 'meta/info.json').read_text())
         if not self.info.get('codebase_version', '').startswith('v3'):
@@ -491,7 +496,7 @@ class B1KLeRobotDataset(BaseImageDataset):
             raise ValueError(f'Episode {index} length/frame indices disagree with metadata')
         if not np.all(table['task_index'].to_numpy() == episode['task_index']):
             raise ValueError(f'Episode {index} task_index disagrees with metadata')
-        state = extract_state(_matrix(table['observation.state']))
+        state = extract_state(_matrix(table['observation.state']), self.gripper_state)
         actions = _matrix(table['action'])
         if actions.shape != (len(table), 23) or not np.isfinite(actions).all():
             raise ValueError(f'Episode {index} requires finite 23-D actions')
@@ -560,7 +565,7 @@ class B1KLeRobotDataset(BaseImageDataset):
                     table = table.filter(pa.array(table['frame_index'].to_numpy() < kept))
                 if len(table):
                     yield {
-                        'state': condition_state(extract_state(_matrix(table['observation.state'])),
+                        'state': condition_state(extract_state(_matrix(table['observation.state']), self.gripper_state),
                                                  table['task_index'].to_numpy(), self.task_map),
                         'action': _matrix(table['action']),
                     }
@@ -571,12 +576,14 @@ class B1KLeRobotDataset(BaseImageDataset):
         files = [(str(path.relative_to(self.root)), path.stat().st_size, path.stat().st_mtime_ns)
                  for path in sorted(paths)]
         payload = {'info': self.info, 'episodes': self.episodes, 'tasks': self.task_map, 'files': files}
+        if self.gripper_state != 'fingers':  # `fingers` keeps the fingerprints of runs from before the option
+            payload['gripper_state'] = self.gripper_state
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def get_normalizer(self, **kwargs):
         from diffusion_policy.b1k.normalization import fit_normalizer
         from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
-        normalizer = fit_normalizer(self.iter_lowdim(), self.cameras)
+        normalizer = fit_normalizer(self.iter_lowdim(), self.cameras, proprio_dim(self.gripper_state))
         if self.observation_mode == 'lowdim':
             result = LinearNormalizer()
             result['obs'], result['action'] = normalizer['state'], normalizer['action']

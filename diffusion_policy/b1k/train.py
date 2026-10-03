@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, Sampler
 from diffusion_policy.b1k.dataset import (B1KLeRobotDataset, expand_task_groups, images_to_float, parse_settle_steps,
                                           resolve_episode_split)
 from diffusion_policy.b1k.model import POLICY_TARGETS, ModelConfig, build_policy, load_checkpoint
-from diffusion_policy.b1k.robot import CAMERAS
+from diffusion_policy.b1k.robot import CAMERAS, GRIPPER_STATES
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 
@@ -389,6 +389,10 @@ def parser():
     result.add_argument('--imagenet-norm', action='store_true')
     result.add_argument('--encoder-weights', choices=['IMAGENET1K_V1'])
     result.add_argument('--freeze-encoder', action='store_true')
+    result.add_argument('--gripper-state', choices=GRIPPER_STATES, default='sum', action=ExplicitChoice,
+                        help='Gripper proprioception: sum (default) adds the two finger positions of each gripper into '
+                             'one opening, giving a 23-value state in the action\'s layout; fingers keeps both (25 '
+                             'values). Resume uses the checkpoint\'s layout (fingers for checkpoints without one)')
     result.add_argument('--resume', type=Path)
     result.add_argument('--horizon', type=int, default=16)
     result.add_argument('--n-obs-steps', type=int, default=2)
@@ -480,6 +484,10 @@ def run_training(args, device, output):
         if checkpoint.get('checkpoint_type') == 'eval' or 'optimizer' not in checkpoint:
             raise ValueError('Cannot resume training from an eval-only checkpoint; use a full checkpoint')
         config = ModelConfig(**checkpoint['config'])
+        if getattr(args, 'gripper_state_explicit', False) and args.gripper_state != config.gripper_state:
+            raise ValueError(f'--gripper-state {args.gripper_state} conflicts with the resumed checkpoint '
+                             f'({config.gripper_state})')
+        args.gripper_state = config.gripper_state
         saved_tasks = checkpoint['selection']['task_names']
         if args.task_names is not None and set(args.task_names) != set(saved_tasks):
             raise ValueError(f'--task-names {args.requested_task_names} select {args.task_names}, but the checkpoint '
