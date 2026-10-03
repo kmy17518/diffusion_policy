@@ -1,10 +1,14 @@
 """Read-only, bounded-memory LeRobot v3 parquet/video sequences."""
 
 from collections import OrderedDict, defaultdict
+from decimal import Decimal
+from fractions import Fraction
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import re
 
 import av
 import numpy as np
@@ -15,6 +19,13 @@ import torch
 
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.b1k.robot import CAMERAS, condition_state, extract_state, resize_rgb
+
+EPISODE_SPLIT_FORMAT = 'isg-episode-split/v1'
+DEFAULT_EPISODE_SPLIT = 'isg_meta/train_split.json'
+TASK_GROUPS_FORMAT = 'isg-task-groups/v1'
+DEFAULT_TASK_GROUPS = 'isg_meta/task_groups.json'
+SETTLE_WINDOWS_FORMAT = 'isg-settle-windows/v1'
+DEFAULT_SETTLE_WINDOWS = 'isg_meta/settle_windows.json'
 
 
 class EpisodeSequenceIndex:
@@ -109,13 +120,156 @@ class VideoReader:
         return np.stack(result)
 
 
+def resolve_episode_split(dataset_path, spec='auto', task_names=None):
+    """Resolve `--episode-split`: auto (<root>/isg_meta/train_split.json if present), none, or a split file path.
+
+    Returns None (no split) or the record saved with checkpoints: resolved file, sha256 of its bytes, format, name,
+    subset 'train', the selected tasks (`task_names`, else every task of the split) and the sorted union of their
+    `train` episodes; load it with `B1KLeRobotDataset(root, record['tasks'], episodes=record['episodes'])`.
+    """
+    if spec == 'none':
+        return None
+    path = (Path(dataset_path) / DEFAULT_EPISODE_SPLIT if spec == 'auto' else Path(spec)).resolve()
+    if not path.is_file():
+        if spec == 'auto':
+            return None
+        raise FileNotFoundError(f'Episode split file not found: {path}')
+    content = path.read_bytes()
+    split = json.loads(content)
+    if not isinstance(split, dict) or split.get('format') != EPISODE_SPLIT_FORMAT or not isinstance(split.get('tasks'), dict):
+        raise ValueError(f'{path} is not an {EPISODE_SPLIT_FORMAT} episode split')
+    names = list(dict.fromkeys([task_names] if isinstance(task_names, str) else task_names or split['tasks']))
+    missing = [name for name in names if name not in split['tasks']]
+    if missing:
+        raise ValueError(f'Selected task(s) {missing} have no entry in episode split {path}')
+    episodes = set()
+    for name in names:
+        train = split['tasks'][name].get('train') if isinstance(split['tasks'][name], dict) else None
+        if not isinstance(train, list) or any(type(index) is not int for index in train):
+            raise ValueError(f'{path}: tasks[{name!r}].train must be a list of integer episode indices')
+        episodes.update(train)
+    return {'file': str(path), 'sha256': hashlib.sha256(content).hexdigest(), 'format': EPISODE_SPLIT_FORMAT,
+            'name': split.get('name'), 'subset': 'train', 'tasks': names, 'episodes': sorted(episodes)}
+
+
+def expand_task_groups(dataset_path, task_names):
+    """Replace every task group of <root>/isg_meta/task_groups.json in `task_names` by the tasks it reaches.
+
+    A group lists task names and/or other groups. None (every task) stays None and without a group file the names
+    are returned unchanged; otherwise the tasks come back without duplicates in order of first appearance. Unknown
+    names, a name that is both a task and a group, empty groups and cycles raise ValueError.
+    """
+    if task_names is None:
+        return None
+    names = [task_names] if isinstance(task_names, str) else list(task_names)
+    path = Path(dataset_path).resolve() / DEFAULT_TASK_GROUPS
+    if not path.is_file():
+        return names
+    content = json.loads(path.read_text())
+    groups = content.get('groups') if isinstance(content, dict) else None
+    if not isinstance(groups, dict) or content.get('format') != TASK_GROUPS_FORMAT:
+        raise ValueError(f'{path} is not an {TASK_GROUPS_FORMAT} task group file')
+    table = pq.read_table(Path(dataset_path) / 'meta/tasks.parquet').to_pydict()
+    tasks = set(next((table[key] for key in ('task_name', 'task', '__index_level_0__') if key in table), []))
+
+    def expand(name, parents):
+        if name in tasks:
+            if name in groups:
+                raise ValueError(f'{name!r} is both a task and a task group in {path}')
+            return [name]
+        if name not in groups:
+            if parents:
+                raise ValueError(f'Task group {parents[-1]!r} in {path} lists unknown task or group {name!r}')
+            raise ValueError(f'Unknown task or task group {name!r}; groups in {path}: {sorted(groups)}; '
+                             f'tasks: {sorted(tasks)}')
+        if name in parents:
+            raise ValueError(f'Task group cycle {" -> ".join([*parents, name])} in {path}')
+        members = groups[name]
+        if not isinstance(members, list) or not members or not all(isinstance(member, str) for member in members):
+            raise ValueError(f'Task group {name!r} in {path} must be a nonempty list of task or group names')
+        return [task for member in members for task in expand(member, (*parents, name))]
+
+    return list(dict.fromkeys(task for name in names for task in expand(name, ())))
+
+
+def parse_settle_steps(spec):
+    """Canonical `--settle-steps` value: `all`, a number of settle frames ('0', '10') or a decimal fraction of each
+    episode's program length ('0.2'; '1.0' is the whole program length, '1' one frame). Raises ValueError otherwise."""
+    text = str(spec).strip()
+    if text == 'all':
+        return text
+    if re.fullmatch(r'[0-9]+', text):
+        return str(int(text))
+    if re.fullmatch(r'[0-9]*\.[0-9]+|[0-9]+\.', text):
+        value = format(Decimal(text).normalize(), 'f')
+        return value if '.' in value else f'{value}.0'
+    raise ValueError(f'--settle-steps must be all, a number of frames (0, 10) or a decimal fraction of the program '
+                     f'length (0.1, 0.2); got {spec!r}')
+
+
+def settle_frames(spec, program_length):
+    """Settle frames that a canonical value other than `all` requests after `program_length` program frames."""
+    return math.ceil(Fraction(spec) * program_length) if '.' in spec else int(spec)
+
+
+def apply_settle_steps(dataset_path, spec, episodes):
+    """Cut episodes (metadata rows; `length` and `dataset_to_index` change in place) to `--settle-steps SPEC`.
+
+    `all` keeps every recorded frame and returns None. Otherwise each episode keeps its program -- the first
+    `program_length` frames listed by <root>/isg_meta/settle_windows.json -- followed by SPEC settle frames, capped
+    at the recorded window; returns the record saved with checkpoints.
+    """
+    spec = parse_settle_steps(spec)
+    if spec == 'all':
+        return None
+    path = Path(dataset_path).resolve() / DEFAULT_SETTLE_WINDOWS
+    if not path.is_file():
+        raise FileNotFoundError(f'--settle-steps {spec} needs {path}, the program length of every episode; only datasets '
+                                'whose episodes end with a recorded settle window ship it')
+    content = path.read_bytes()
+    windows = json.loads(content)
+    if not isinstance(windows, dict) or windows.get('format') != SETTLE_WINDOWS_FORMAT or \
+            not isinstance(windows.get('episodes'), dict):
+        raise ValueError(f'{path} is not an {SETTLE_WINDOWS_FORMAT} file')
+    recorded = settle = capped = 0
+    for row in episodes:
+        entry = windows['episodes'].get(str(row['episode_index']))
+        if not entry or entry.get('length') != row['length'] or not 0 < entry.get('program_length', 0) <= row['length']:
+            raise ValueError(f'{path} has no settle window for episode {row["episode_index"]} of length {row["length"]} '
+                             f'(entry {entry}); regenerate it for this dataset')
+        program = entry['program_length']
+        wanted = settle_frames(spec, program)
+        kept = min(wanted, row['length'] - program)
+        capped += wanted > kept
+        recorded += row['length']
+        settle += kept
+        row['length'] = program + kept
+        row['dataset_to_index'] = row['dataset_from_index'] + row['length']
+    if capped:
+        print(f'WARNING: --settle-steps {spec} exceeds the recorded settle window of {capped} of {len(episodes)} '
+              'episodes; they keep their whole window', flush=True)
+    return {'spec': spec, 'file': str(path), 'sha256': hashlib.sha256(content).hexdigest(),
+            'format': SETTLE_WINDOWS_FORMAT, 'frames': sum(row['length'] for row in episodes), 'settle_frames': settle,
+            'recorded_frames': recorded, 'capped_episodes': capped}
+
+
 class B1KLeRobotDataset(BaseImageDataset):
     def __init__(self, dataset_path, task_names=None, horizon=16, n_obs_steps=2,
                  n_action_steps=8, cameras=tuple(CAMERAS), image_size=96,
                  pad_before=None, pad_after=None, episode_cache_size=8,
                  parquet_cache_mb=256, max_episodes=None, observation_mode='image',
                  obs_steps=None, imagenet_norm=False, language_conditioning='none',
-                 prompt_source='task_name'):
+                 prompt_source='task_name', episodes=None, settle_steps='all'):
+        """
+        episodes (episode split, see `resolve_episode_split`): episode_index values to load, applied after the task
+        filter and before `max_episodes`. Each must be present locally with all files it needs and belong to a
+        selected task, otherwise construction fails, so the selection equals the request exactly. None loads every
+        local episode of the selected tasks.
+
+        settle_steps (see `apply_settle_steps`): cut every episode after its program plus that many settle frames
+        without rewriting the dataset. Sequences (edge-padded at the cut), the normalizer statistics of
+        `iter_lowdim` and the fingerprint cover the kept frames only.
+        """
         self.root = Path(dataset_path).resolve()
         self.info = json.loads((self.root / 'meta/info.json').read_text())
         if not self.info.get('codebase_version', '').startswith('v3'):
@@ -164,6 +318,7 @@ class B1KLeRobotDataset(BaseImageDataset):
         if unknown:
             raise ValueError(f'Unknown task(s) {sorted(unknown)}; available: {sorted(all_tasks.values())}')
         selected = {i for i, name in all_tasks.items() if not names or name in names}
+        requested = None if episodes is None else {int(index) for index in episodes}
         self.episodes = []
         metadata_paths = sorted((self.root / 'meta/episodes').glob('*/*.parquet'))
         if not metadata_paths:
@@ -179,7 +334,10 @@ class B1KLeRobotDataset(BaseImageDataset):
                 columns += [f'videos/{key}/{field}' for field in
                             ('chunk_index', 'file_index', 'from_timestamp', 'to_timestamp')]
             table = file.read(columns=columns)
-            if 'task_index' in schema:
+            if requested is not None:
+                table = table.filter(pc.is_in(table['episode_index'],
+                                              value_set=pa.array(sorted(requested), table['episode_index'].type)))
+            elif 'task_index' in schema:
                 table = table.filter(pc.is_in(table['task_index'], value_set=pa.array(sorted(selected))))
             for row in table.to_pylist():
                 if 'task_index' not in row:
@@ -188,10 +346,13 @@ class B1KLeRobotDataset(BaseImageDataset):
                         raise ValueError(f'Episode {row["episode_index"]} needs exactly one categorical task')
                     row['task_index'] = ids[0]
                 if row['task_index'] not in selected:
+                    if requested is not None:
+                        raise ValueError(f'Requested episode {row["episode_index"]} belongs to task '
+                                         f'{all_tasks.get(row["task_index"], row["task_index"])!r}, which is not selected')
                     continue
                 data_path = self.data_path(row)
                 if not data_path.is_file():
-                    if names:
+                    if names or requested is not None:
                         raise FileNotFoundError(f'Selected episode {row["episode_index"]}: missing {data_path}')
                     continue
                 if row['length'] <= 0 or row['dataset_to_index'] - row['dataset_from_index'] != row['length']:
@@ -204,9 +365,12 @@ class B1KLeRobotDataset(BaseImageDataset):
         ids = [row['episode_index'] for row in self.episodes]
         if len(set(ids)) != len(ids):
             raise ValueError('Duplicate episode_index in metadata')
+        if requested is not None and set(ids) != requested:
+            raise ValueError(f'Requested episode(s) {sorted(requested - set(ids))} are not in the local episode metadata')
         present = {row['task_index'] for row in self.episodes}
         if names and selected - present:
-            raise ValueError(f'No episodes of task(s) {[all_tasks[i] for i in sorted(selected - present)]} on disk')
+            raise ValueError(f'No {"requested " if requested is not None else ""}episodes of task(s) '
+                             f'{[all_tasks[i] for i in sorted(selected - present)]} on disk')
         if max_episodes is not None:
             if max_episodes < 1:
                 raise ValueError('max_episodes must be positive')
@@ -217,6 +381,10 @@ class B1KLeRobotDataset(BaseImageDataset):
             raise ValueError('No episodes with local data found')
         present = {row['task_index'] for row in self.episodes}
         self.task_map = {i: all_tasks[i] for i in sorted(present)}
+        self.recorded_lengths = {row['episode_index']: row['length'] for row in self.episodes}
+        self.settle = apply_settle_steps(self.root, settle_steps, self.episodes)
+        if self.settle:
+            print(json.dumps({'settle_steps': self.settle}), flush=True)
         self.sampler = EpisodeSequenceIndex(
             [row['length'] for row in self.episodes], horizon,
             n_obs_steps - 1 if pad_before is None else pad_before,
@@ -298,8 +466,8 @@ class B1KLeRobotDataset(BaseImageDataset):
         if not parts:
             raise ValueError(f'Episode {index} absent from {path}')
         table = pa.concat_tables(parts).sort_by('frame_index')
-        if len(table) != episode['length'] or not np.array_equal(
-                table['frame_index'].to_numpy(), np.arange(episode['length'])):
+        recorded = self.recorded_lengths[index]  # whole episodes, of which the sampler reads the kept frames
+        if len(table) != recorded or not np.array_equal(table['frame_index'].to_numpy(), np.arange(recorded)):
             raise ValueError(f'Episode {index} length/frame indices disagree with metadata')
         if not np.all(table['task_index'].to_numpy() == episode['task_index']):
             raise ValueError(f'Episode {index} task_index disagrees with metadata')
@@ -358,13 +526,17 @@ class B1KLeRobotDataset(BaseImageDataset):
         """Stream each selected packed file once; no image decoding or frame index allocation."""
         by_file = defaultdict(list)
         for episode in self.episodes:
-            by_file[self.data_path(episode)].append(episode['episode_index'])
-        for path, ids in by_file.items():
-            for batch in pq.ParquetFile(path).iter_batches(
-                    batch_size=batch_size,
-                    columns=['episode_index', 'task_index', 'observation.state', 'action']):
+            by_file[self.data_path(episode)].append(episode)
+        columns = ['episode_index', 'task_index', 'observation.state', 'action'] + (['frame_index'] if self.settle else [])
+        for path, episodes in by_file.items():
+            ids = np.array([episode['episode_index'] for episode in episodes], dtype=np.int64)  # ascending
+            lengths = np.array([episode['length'] for episode in episodes], dtype=np.int64)
+            for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_size, columns=columns):
                 table = pa.Table.from_batches([batch])
                 table = table.filter(pc.is_in(table['episode_index'], value_set=pa.array(ids)))
+                if self.settle:
+                    kept = lengths[np.searchsorted(ids, table['episode_index'].to_numpy())]
+                    table = table.filter(pa.array(table['frame_index'].to_numpy() < kept))
                 if len(table):
                     yield {
                         'state': condition_state(extract_state(_matrix(table['observation.state'])),

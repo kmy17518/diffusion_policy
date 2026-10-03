@@ -34,10 +34,59 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/train_b1k.py \
   --max-steps 100000 --batch-size 64 --num-workers 4 --device cuda
 ```
 
-`--dataset-root` aliases `--dataset-path`. Omit `--task-names` to use all locally present episodes/tasks; multiple names are space-separated. Unknown names and requested tasks without episodes fail explicitly. Noncontiguous/nonzero episode IDs and partial downloads are supported. No missing data is downloaded. Missing selected camera files fail before training. The output must be outside the dataset tree, and an existing nonempty output requires `--resume`.
+`--dataset-root` aliases `--dataset-path`. Omit `--task-names` to use all locally present episodes/tasks; multiple names are space-separated, and the names of a dataset's [task groups](#task-groups) select their tasks. Unknown names and requested tasks without episodes fail explicitly. Noncontiguous/nonzero episode IDs and partial downloads are supported. No missing data is downloaded. Missing selected camera files fail before training. The output must be outside the dataset tree, and an existing nonempty output requires `--resume`.
 
 Defaults: trajectory horizon 16, observation history 2, executed prediction steps 8, images 96×96, all three cameras, U-Net widths 256/512/1024, diffusion embedding 256, cosine beta schedule, 100 training/inference noise steps, epsilon prediction, AdamW learning rate 1e-4. `--scheduler ddim --num-inference-steps 10` chooses DDIM. `--cameras head left_wrist` avoids loading the omitted camera. `--image-size`, `--horizon`, `--n-obs-steps`, `--n-action-steps`, `--down-dims`, and `--diffusion-step-embed-dim` are configurable. Horizon must be divisible by the U-Net downsampling factor. `--max-episodes` explicitly limits data for debugging; it is recorded in the checkpoint and must not eliminate a requested task.
 
+### Episode split (`--episode-split`)
+
+`--episode-split auto` (default) trains on a dataset's fixed split when it ships one: `<dataset root>/isg_meta/train_split.json` if that file exists, otherwise every episode of the selected tasks exactly as before (the challenge demos have no such file; their selection and fingerprint are unchanged). `none` ignores the file; a path selects that file, which must exist. The file must declare `"format": "isg-episode-split/v1"`. The selected tasks are `--task-names` or, when omitted, every task of the split; each must have an entry under `tasks` (the error names the task and the file), and training uses the sorted union of their `train` episodes. `B1KLeRobotDataset(episodes=...)` applies that list after the task filter and before `--max-episodes` (which still truncates on top): every listed episode must exist locally with its data and camera files and belong to a selected task, or construction fails, so a split episode is never silently dropped. The trainer prints one `episode_split` JSON line (name, file, episode count, tasks).
+
+```bash
+source /tmp/dev/env.sh
+cd "$DP_DIR"
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/train_b1k.py \
+  --dataset-path /tmp/dev/datasets/isg-init \
+  --task-names camera_relocalization-standard \
+  --output-dir "$DP_DIR/outputs/isg-camera-relocalization" \
+  --max-steps 100000 --batch-size 64 --num-workers 4 --device cuda
+```
+
+This trains on the task's 100 `train` episodes (26 are held out). Full and evaluation checkpoints record `selection.episode_split` next to `task_names` / `max_episodes` / `episode_indices` (evaluation exports carry the same `selection`): the resolved absolute file, the SHA-256 of its bytes, format, split name, subset `train`, the selected tasks and the sorted episodes, or `None` without a split. `config.json` and the W&B config carry it as `training.episode_split`; the dataset fingerprint covers the selected episodes. On resume the checkpoint's selection is authoritative: without `--episode-split` the recorded split episodes are reused even if the file has changed since, and checkpoints without a split (or written before this option) resume without one; the dataset root is not searched again. An explicit `--episode-split` must select the identical episode list. `tests/test_b1k.py` covers resolution (auto, none, path, missing task), exact selection (other-task, absent and missing-data episodes, `--max-episodes`), the checkpoint/config records and both resume rules.
+
+### Task groups
+
+`--task-names` accepts the names of task groups that a dataset defines in `<dataset root>/isg_meta/task_groups.json` (`"format": "isg-task-groups/v1"`, `"groups": {"name": [member, ...]}`). A member is a task name or another group, and groups and tasks can be mixed on the command line. `isg-init` ships `camera_relocalization`, `object_scaling`, `mental_rotation`, `iors_ontop_small`, `iors_ontop`, `iors_small`, `iors_large`, `iors`, `alignment`, `disembedding`, `cm_articulation_small`, `cm_articulation_large`, `cm_articulation`, `cm_attachment` and `cm` (members and task indices in its README). The names are expanded once at startup, before the episode split is resolved; duplicates are dropped and the dataset receives plain task names, so a group trains on the union of its tasks' `train` episodes and the normalizer is fitted on exactly those frames. The trainer prints one `task_groups` JSON line (requested names, tasks); `config.json` and the W&B config keep the names as given in `training.requested_task_names`, while `training.task_names`, `tasks` and every checkpoint's `selection` hold the tasks. An unknown name, a member that is neither a task nor a group, a name that is both, an empty group or a cycle fails with the file named; without a group file the names are used unchanged. On resume, `--task-names` is expanded again with the current file and must select the checkpoint's tasks (omit it to reuse them).
+
+```bash
+source /tmp/dev/env.sh
+cd "$DP_DIR"
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/train_b1k.py \
+  --dataset-path /tmp/dev/datasets/isg-init \
+  --task-names cm_articulation_small \
+  --output-dir "$DP_DIR/outputs/isg-cm-articulation-small" \
+  --max-steps 100000 --batch-size 64 --num-workers 4 --device cuda
+```
+
+This trains on the 200 `train` episodes of the two small-scale articulation tasks (blender open and close), normalized with statistics of those 200 episodes.
+
+### Settle steps (`--settle-steps`)
+
+Every `isg-init` episode is its program (P frames) followed by a recorded settle window of max(50, ceil(0.2·P)) frames in which the robot holds its final command. `--settle-steps SPEC` chooses how much of the window to train on when the episodes are loaded, so one dataset serves every setting and no truncated copy is needed (`/tmp/dev/scripts/truncate-isg-settle.py` writes one, with the window removed, for trainers without this flag): `all` (default) keeps every recorded frame, an integer keeps that many settle frames (`0` keeps the program only), and a decimal keeps that fraction of each episode's program length, rounded up (`0.1`, `0.2`; `1` is one frame, `1.0` is P frames). A request beyond an episode's recorded window keeps the whole window, and the trainer prints a warning with the number of such episodes (on `isg-init`, 0–50 frames and fractions up to 0.2 never exceed a window). Values are canonicalized (`010` = `10`, `0.20` = `0.2`); anything else fails before the output directory is touched.
+
+The program lengths come from `<dataset root>/isg_meta/settle_windows.json` (`"format": "isg-settle-windows/v1"`, written by `/tmp/dev/scripts/make-isg-settle-windows.py`, which verifies every episode's settle window against its actions). A value other than `all` fails without that file, so a dataset without settle windows (the challenge demos, a truncated copy) cannot be cut by mistake, and every selected episode needs an entry whose recorded length matches `meta/episodes`. The cut is applied after the episode split and `--max-episodes`. It changes the sequences that are sampled (edge-padded at the cut exactly as at the end of a truncated episode), the frames the normalizer is fitted on and the dataset fingerprint.
+
+```bash
+source /tmp/dev/env.sh
+cd "$DP_DIR"
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/train_b1k.py \
+  --dataset-path /tmp/dev/datasets/isg-init \
+  --task-names cm_articulation_small --settle-steps 0.1 \
+  --output-dir "$DP_DIR/outputs/isg-cm-articulation-small-settle-0.1" \
+  --max-steps 100000 --batch-size 64 --num-workers 4 --device cuda
+```
+
+On `cm_articulation_small`'s 200 `train` episodes, `isg-init` has 185,375 frames: `--settle-steps 0` keeps 154,413 (the frames of the truncated copy: the same 153,013 sequences at the default horizon, a bit-identical normalizer and identical samples), `10` keeps 156,413, `0.1` keeps 169,942, and `0.2` keeps all 185,375. The dataset prints one `settle_steps` JSON line. Full and evaluation checkpoints record `selection.settle_steps`: the canonical SPEC, the resolved file, the SHA-256 of its bytes, its format, and the kept, settle and recorded frame counts and number of capped episodes, or `None` for `all`. `config.json` carries the same record as `settle_steps`, `training.settle_steps` (also in the W&B config) holds the canonical SPEC. On resume the checkpoint's value is authoritative: omit the flag to reuse it; an explicit SPEC must equal it, and checkpoints without the record resume on every recorded frame. `tests/test_b1k.py` checks parsing and exact fractions, compares the cut with a physically truncated copy (every sequence, the normalizer) and covers capping, missing or stale window files, the records and the resume rules.
 ### Optional CLIP language + FiLM
 
 Add `--language-conditioning clip_film --prompt-source task_name` to an image recipe, or use `--prompt-source task_description`. Defaults are **`none`** and **`task_name`**, so old model/checkpoint tensor keys and categorical state conditioning are unchanged. The existing 25-D state plus task one-hot remains present in language mode too.
