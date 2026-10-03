@@ -6,7 +6,7 @@ import importlib
 import torch
 from diffusers import DDIMScheduler, DDPMScheduler
 
-from diffusion_policy.b1k.robot import CAMERAS
+from diffusion_policy.b1k.robot import CAMERAS, GRIPPER_STATES, proprio_dim
 
 
 POLICY_TARGETS = {
@@ -59,9 +59,12 @@ class ModelConfig:
     freeze_encoder: bool = False
     language_conditioning: str = 'none'
     prompt_source: str = 'task_name'
-    # Append the one-hot task id to the 25-D state. True is the v1 behavior and therefore the dataclass
+    # Append the one-hot task id to the proprioceptive state. True is the v1 behavior and therefore the dataclass
     # default (checkpoints without the field keep it); the trainer CLI defaults to --no-task-onehot.
     task_onehot: bool = True
+    # Gripper proprioception layout (robot.GRIPPER_STATES). `fingers` (25 values) is the layout of checkpoints that
+    # do not record it and therefore the dataclass default; the trainer CLI defaults to `sum` (23 values).
+    gripper_state: str = 'fingers'
 
     @property
     def lowdim(self):
@@ -78,7 +81,7 @@ class ModelConfig:
                 'observation_mode': 'lowdim' if self.lowdim else 'image',
                 'obs_steps': self.obs_steps, 'imagenet_norm': self.imagenet_norm,
                 'language_conditioning': self.language_conditioning, 'prompt_source': self.prompt_source,
-                'task_onehot': self.task_onehot}
+                'task_onehot': self.task_onehot, 'gripper_state': self.gripper_state}
 
     def to_dict(self):
         return asdict(self)
@@ -86,6 +89,8 @@ class ModelConfig:
     def validate(self):
         if self.variant not in POLICY_TARGETS:
             raise ValueError(f'Unknown diffusion variant {self.variant!r}')
+        if self.gripper_state not in GRIPPER_STATES:
+            raise ValueError(f'gripper_state must be one of {GRIPPER_STATES}')
         if self.language_conditioning not in ('none', 'clip_film'):
             raise ValueError('language_conditioning must be none or clip_film')
         if self.prompt_source not in ('task_name', 'task_description'):
@@ -188,7 +193,7 @@ def build_policy(config, task_map, initialize_encoder=True):
     global_cond = config.conditioning == 'global'
     if len(task_map) > 1 and not config.task_onehot and config.language_conditioning == 'none':
         raise ValueError('Several tasks but no task conditioning: enable task_onehot or clip_film language conditioning')
-    obs_dim = 25 + (len(task_map) if config.task_onehot else 0)
+    obs_dim = proprio_dim(config.gripper_state) + (len(task_map) if config.task_onehot else 0)
     if config.lowdim:
         common.update(obs_dim=obs_dim, action_dim=23, pred_action_steps_only=config.pred_action_steps_only)
         input_dim = 23 + (obs_dim if config.conditioning == 'inpainting' else 0)
