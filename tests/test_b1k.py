@@ -122,8 +122,8 @@ def test_native_partial_root_and_boundaries(root):
             offset = 5 + camera_index * 11 + (0 if episode['episode_index'] == 7 else 9)
             expected = offset + frames[:2]
             np.testing.assert_allclose(sample['obs'][camera][:, 0, 0, 0] * 255, expected, atol=0.01)
-        expected_state = np.arange(61)[STATE_INDICES] + episode['episode_index'] + frames[:2, None] / 10
-        np.testing.assert_allclose(sample['obs']['state'][:, :25], expected_state, rtol=1e-6)
+        expected_state = extract_state(np.arange(61) + episode['episode_index'] + frames[:2, None] / 10)
+        np.testing.assert_allclose(sample['obs']['state'][:, :23], expected_state, rtol=1e-6)
         assert torch.all(sample['action'][:, 6] == 0)
         # Position n_obs_steps-1 is the current control timestep.
         assert sample['action'][1, 0] == episode['episode_index'] + frames[1]
@@ -186,7 +186,7 @@ def test_hdf5_ingestion_and_default_normalization(root, tmp_path):
             group['obs/head'] = dataset._video.read(dataset.video_path(row, 'head'),
                                                     data['timestamp'] + row[f'videos/{CAMERAS["head"][0]}/from_timestamp'])
     shape_meta = {'action': {'shape': [23]}, 'obs': {
-        'robot_qpos': {'shape': [25], 'type': 'low_dim'},
+        'robot_qpos': {'shape': [23], 'type': 'low_dim'},
         'head': {'shape': [3, 16, 16], 'type': 'rgb'}}}
     upstream = RobomimicReplayImageDataset(shape_meta, str(hdf5_path), horizon=4,
                                           n_obs_steps=2, pad_before=1, pad_after=2)
@@ -194,7 +194,7 @@ def test_hdf5_ingestion_and_default_normalization(root, tmp_path):
     for index in range(len(dataset)):
         native, default = dataset[index], upstream[index]
         torch.testing.assert_close(native['action'], default['action'])
-        torch.testing.assert_close(native['obs']['state'][:, :25], default['obs']['robot_qpos'])
+        torch.testing.assert_close(native['obs']['state'][:, :23], default['obs']['robot_qpos'])
         torch.testing.assert_close(native['obs']['head'], default['obs']['head'], atol=1 / 255, rtol=0)
     normalizer = upstream.get_normalizer()
     action = upstream[0]['action']
@@ -205,24 +205,24 @@ def test_hdf5_ingestion_and_default_normalization(root, tmp_path):
 def test_streaming_limits_match_zarr_and_no_clipping(root):
     dataset = make_dataset(root)
     batches = list(dataset.iter_lowdim(batch_size=3))
-    normalizer = fit_normalizer(iter(batches), dataset.cameras)
+    normalizer = fit_normalizer(iter(batches), dataset.cameras, 23)
     actions = np.concatenate([batch['action'] for batch in batches])
     state = np.concatenate([batch['state'] for batch in batches])
     upstream = LinearNormalizer()
-    upstream.fit({'action': zarr.array(actions), 'state': zarr.array(state[:, :25])}, mode='limits')
+    upstream.fit({'action': zarr.array(actions), 'state': zarr.array(state[:, :23])}, mode='limits')
     for key, values in [('action', actions), ('state', state)]:
         nvalues = normalizer[key].normalize(values)
-        reference = upstream[key].normalize(values if key == 'action' else values[:, :25])
-        torch.testing.assert_close(nvalues if key == 'action' else nvalues[:, :25], reference)
+        reference = upstream[key].normalize(values if key == 'action' else values[:, :23])
+        torch.testing.assert_close(nvalues if key == 'action' else nvalues[:, :23], reference)
         for field in ('min', 'max', 'mean', 'std'):
             actual = normalizer[key].get_input_stats()[field]
             if key == 'state':
-                actual = actual[:25]
+                actual = actual[:23]
             torch.testing.assert_close(actual, upstream[key].get_input_stats()[field], rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(normalizer[key].unnormalize(nvalues), torch.from_numpy(values), rtol=1e-5, atol=1e-5)
     assert torch.all(normalizer['action'].normalize(actions)[:, 6] == 0)
     assert normalizer['action'].normalize(actions + 100).max() > 1
-    torch.testing.assert_close(normalizer['state'].normalize(state)[:, 25:], torch.from_numpy(state[:, 25:]))
+    torch.testing.assert_close(normalizer['state'].normalize(state)[:, 23:], torch.from_numpy(state[:, 23:]))
 
 
 @pytest.mark.parametrize('scheduler', ['ddpm', 'ddim'])
@@ -230,7 +230,7 @@ def test_actual_policy_backward_and_inference(root, scheduler):
     dataset = make_dataset(root, cameras=['head'])
     config = ModelConfig(horizon=4, n_obs_steps=2, n_action_steps=3, cameras=('head',), image_size=16,
                          down_dims=(16, 32), diffusion_step_embed_dim=16, num_train_timesteps=4,
-                         num_inference_steps=2, scheduler=scheduler)
+                         num_inference_steps=2, scheduler=scheduler, gripper_state='sum')
     policy = build_policy(config, dataset.task_map)
     policy.set_normalizer(dataset.get_normalizer())
     sample = dataset[0]
@@ -262,7 +262,7 @@ def test_near_constant_limits():
     values[:, 0] = [7, 7 + 1e-6, 7 + 2e-6]
     values[:, -1] = 1
     actions = values[:, :23].copy()
-    normalizer = fit_normalizer([{'state': values, 'action': actions}], [])
+    normalizer = fit_normalizer([{'state': values, 'action': actions}], [], 25)
     upstream = LinearNormalizer()
     upstream.fit(actions)
     torch.testing.assert_close(normalizer['action'].normalize(actions), upstream.normalize(actions))
@@ -342,7 +342,9 @@ def test_rgb_rgba_padding_and_state_mapping():
     resized = resize_rgb(image, 16)
     assert resized.shape == (16, 16, 3)
     assert not resized[:4].any() and (resized[4:12] == 255).all()
-    np.testing.assert_array_equal(extract_state(np.arange(61)), STATE_INDICES)
+    np.testing.assert_array_equal(extract_state(np.arange(61), 'fingers'), STATE_INDICES)
+    np.testing.assert_array_equal(extract_state(np.arange(61)), np.r_[STATE_INDICES[:14], 24 + 25,
+                                                                      STATE_INDICES[16:23], 49 + 50])
     with pytest.raises(ValueError):
         resize_rgb(image.astype(np.float32), 16)
 
@@ -512,9 +514,9 @@ def test_lowdim_reader_no_video_and_full_horizon(root):
     assert not dataset.cameras
     sample = dataset[2]
     _, frames = dataset.sampler.locate(2)
-    assert isinstance(sample['obs'], torch.Tensor) and sample['obs'].shape == (4, 27)
-    expected = np.arange(61)[STATE_INDICES] + 7 + frames[:, None] / 10
-    np.testing.assert_allclose(sample['obs'][:, :25], expected, rtol=1e-6)
+    assert isinstance(sample['obs'], torch.Tensor) and sample['obs'].shape == (4, 23 + 2)
+    expected = extract_state(np.arange(61) + 7 + frames[:, None] / 10)
+    np.testing.assert_allclose(sample['obs'][:, :23], expected, rtol=1e-6)
     assert set(dataset.get_normalizer().params_dict) == {'obs', 'action'}
     assert not dataset._video.frames and not dataset._video.containers
     assert sample['action'][1, 0] == 7 + frames[1]
@@ -1234,3 +1236,36 @@ def test_train_records_settle_steps_and_resume_keeps_the_checkpoint_value(root, 
         train_main(longrun_args(root, plain) + ['--max-steps', '2', '--resume', str(plain), '--settle-steps', '0'])
     train_main(longrun_args(root, plain) + ['--max-steps', '2', '--resume', str(plain)])
     assert load_checkpoint(plain)['selection']['settle_steps'] is None
+
+
+def test_gripper_state_is_recorded_and_legacy_checkpoints_resume_and_serve(root, tmp_path):
+    from diffusion_policy.b1k.model import load_checkpoint
+    run, fingers = tmp_path / 'sum', tmp_path / 'fingers'
+    train_main(longrun_args(root, run) + ['--max-steps', '1'])
+    policy, summed = load_policy(run)
+    assert summed['config']['gripper_state'] == 'sum' and policy.normalizer['obs'].params_dict['scale'].shape == (23 + 2,)
+    assert json.loads((run / 'config.json').read_text())['training']['gripper_state'] == 'sum'
+    train_main(longrun_args(root, fingers) + ['--max-steps', '1', '--gripper-state', 'fingers'])
+    assert load_checkpoint(fingers)['config']['gripper_state'] == 'fingers'
+    # A checkpoint from before the option (no recorded layout) resumes and serves with both finger positions.
+    legacy = torch.load(fingers / 'step-00000001.pt', weights_only=True)
+    del legacy['config']['gripper_state']
+    torch.save(legacy, fingers / 'step-00000001.pt')
+    assert ModelConfig(**legacy['config']).gripper_state == 'fingers'
+    with pytest.raises(ValueError, match=r'--gripper-state sum conflicts with the resumed checkpoint \(fingers\)'):
+        train_main(longrun_args(root, fingers) + ['--max-steps', '2', '--resume', str(fingers), '--gripper-state', 'sum'])
+    train_main(longrun_args(root, fingers) + ['--max-steps', '2', '--resume', str(fingers)])
+    resumed_policy, resumed = load_policy(fingers)
+    assert resumed['step'] == 2 and resumed_policy.normalizer['obs'].params_dict['scale'].shape == (25 + 2,)
+    for model, checkpoint in ((policy, summed), (resumed_policy, resumed)):
+        assert B1KPolicySession(model, checkpoint['config'], checkpoint['task_map']).act(observation(1)).shape == (1, 23)
+    # `fingers` keeps the dataset fingerprint of runs from before the option; `sum` gets its own.
+    dataset = make_dataset(root, gripper_state='fingers')
+    paths = {dataset.data_path(row) for row in dataset.episodes}
+    paths.update(dataset.video_path(row, camera) for row in dataset.episodes for camera in dataset.cameras)
+    files = [(str(path.relative_to(dataset.root)), path.stat().st_size, path.stat().st_mtime_ns) for path in sorted(paths)]
+    payload = {'info': dataset.info, 'episodes': dataset.episodes, 'tasks': dataset.task_map, 'files': files}
+    assert dataset.fingerprint() == hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    assert make_dataset(root).fingerprint() != dataset.fingerprint()
+    with pytest.raises(ValueError, match="Unknown gripper_state 'both'"):
+        make_dataset(root, gripper_state='both')
