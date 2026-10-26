@@ -14,10 +14,15 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 from diffusion_policy.b1k.model import ModelConfig, load_policy
-from diffusion_policy.b1k.robot import (CAMERAS, GOAL_OBS_KEYS, PROPRIO_KEY, condition_state, extract_state, goal_key,
-                                        resize_rgb)
+from diffusion_policy.b1k.robot import (CAMERAS, DEFAULT_GRIPPER_SNAP, GOAL_OBS_KEYS, GRIPPER_ACTION_DIMS, PROPRIO_KEY,
+                                        absolute_actions, condition_state, extract_state, goal_key, resize_rgb,
+                                        snap_grippers)
 
 LOGGER = logging.getLogger(__name__)
+# The evaluator's camera names (ispatialgym-eval-vec ws_policy.CAMERAS, ACT's b1k_server) for our camera keys: the
+# handshake's goal_views must name the views the client holds goal images for.
+EVALUATOR_CAMERA_NAMES = {'head': 'zed_link', 'left_wrist': 'left_realsense_link', 'right_wrist': 'right_realsense_link'}
+OBSERVATION_KEYS = {EVALUATOR_CAMERA_NAMES[camera]: keys[1] for camera, keys in CAMERAS.items()}
 
 
 def pack_array(obj):
@@ -46,11 +51,16 @@ unpackb = functools.partial(msgpack.unpackb, object_hook=unpack_array, strict_ma
 
 
 class B1KPolicySession:
-    def __init__(self, policy, config, task_map, action_horizon=None, task_name=None, language=None, fixed_goals=None):
+    def __init__(self, policy, config, task_map, action_horizon=None, task_name=None, language=None, fixed_goals=None,
+                 gripper_snap=DEFAULT_GRIPPER_SNAP):
         self.policy = policy
         self.model_config = ModelConfig(**config)
         self.config = self.model_config.to_dict()
         self.task_map = task_map
+        # relative plans become absolute with the state they were predicted from (`absolute_actions`) before they are
+        # stored; every returned action is clamped and snapped (`snap_grippers`, ACT's serving rule; None: untouched)
+        self.relative = self.model_config.action_representation == 'relative'
+        self.gripper_snap = gripper_snap
         # Goal images: per request under `goal::<camera observation key>`, else the fixed images given at server
         # start (--goal-image CAMERA=PATH), else the request is rejected for goal-conditioned checkpoints.
         self.goal_views = tuple(self.model_config.goal_views) if self.model_config.goal_fusion != 'none' else ()
@@ -100,18 +110,21 @@ class B1KPolicySession:
             raise ValueError('proprio must have shape (61,) or (B,61)')
         batch_size = len(state)
         ids = self._tasks(obs, batch_size)
-        state = condition_state(extract_state(state, self.model_config.gripper_state), np.asarray(ids), self.task_map,
-                                self.model_config.task_onehot)
+        proprio = extract_state(state, self.model_config.gripper_state)
+        state = condition_state(proprio, np.asarray(ids), self.task_map, self.model_config.task_onehot)
         current = {'state': state}
         if self.language is not None:
             current['lang_emb'] = self.language['embeddings'][[self.language_rows[index] for index in ids]].numpy()
+        resize_mode = self.config.get('resize_mode', 'dp')
         for camera in (() if self.model_config.lowdim else self.config['cameras']):
             images = np.asarray(obs[CAMERAS[camera][1]])
             if images.ndim == 3:
                 images = images[None]
             if images.ndim != 4 or len(images) != batch_size:
                 raise ValueError(f'Camera {camera} batch does not match proprio')
-            images = np.stack([resize_rgb(image, self.config['image_size']) for image in images])
+            # frames already at the training size (the evaluator resizes and quantizes on its side with ACT's path)
+            # pass through unchanged in resize mode act; others are resized here with the training-time resize
+            images = np.stack([resize_rgb(image, self.config['image_size'], resize_mode) for image in images])
             current[camera] = np.moveaxis(images, -1, 1).astype(np.float32) / 255.
         goals = {}
         for view in self.goal_views:
@@ -126,7 +139,7 @@ class B1KPolicySession:
                 images = np.broadcast_to(self.fixed_goals[view], (batch_size, *self.fixed_goals[view].shape))
             else:
                 raise ValueError(f'Goal-conditioned checkpoint needs {key} in the observation (or --goal-image {view}=PATH)')
-            images = np.stack([resize_rgb(image, self.config['image_size']) for image in images])
+            images = np.stack([resize_rgb(image, self.config['image_size'], resize_mode) for image in images])
             goals[goal_key(view)] = np.moveaxis(images, -1, 1).astype(np.float32) / 255.
         if len(self.histories) != batch_size:
             self.reset()
@@ -140,6 +153,7 @@ class B1KPolicySession:
             self.task_ids[slot] = task
             frame = {key: value[slot].copy() for key, value in current.items()}
             frame['__goals__'] = {key: value[slot].copy() for key, value in goals.items()}
+            frame['__proprio__'] = proprio[slot].copy()  # the reference of a relative plan predicted at this frame
             if not self.histories[slot]:
                 for _ in range(self.config['n_obs_steps'] - 1):
                     self.histories[slot].append(frame)
@@ -160,9 +174,12 @@ class B1KPolicySession:
                 raise ValueError(f'Unexpected policy action shape {predicted.shape}')
             if not np.isfinite(predicted).all():
                 raise ValueError('Policy returned non-finite action')
+            if self.relative:  # absolute commands with the state the plan was predicted from (the current frame's)
+                reference = np.stack([self.histories[slot][-1]['__proprio__'] for slot in needs_plan])
+                predicted = absolute_actions(predicted.astype(np.float64), reference).astype(np.float32)
             for slot, plan in zip(needs_plan, predicted):
                 self.actions[slot].extend(plan[:self.action_horizon].astype(np.float32))
-        return np.stack([queue.popleft() for queue in self.actions]).astype(np.float32)
+        return snap_grippers(np.stack([queue.popleft() for queue in self.actions]).astype(np.float32), self.gripper_snap)
 
 
 def health_check(connection, request):
@@ -186,32 +203,54 @@ def load_goal_images(specs):
 
 class WebsocketPolicyServer:
     def __init__(self, policy, checkpoint, host='0.0.0.0', port=8000,
-                 action_horizon=None, task_name=None, fixed_goals=None):
+                 action_horizon=None, task_name=None, fixed_goals=None, gripper_snap=DEFAULT_GRIPPER_SNAP):
         self.policy, self.checkpoint = policy, checkpoint
         self.host, self.port = host, port
         self.action_horizon, self.task_name = action_horizon, task_name
         self.fixed_goals = fixed_goals or {}
+        self.gripper_snap = gripper_snap
         self.new_session()
 
     def new_session(self):
         return B1KPolicySession(self.policy, self.checkpoint['config'], self.checkpoint['task_map'],
-                                self.action_horizon, self.task_name, self.checkpoint.get('language'), self.fixed_goals)
+                                self.action_horizon, self.task_name, self.checkpoint.get('language'), self.fixed_goals,
+                                self.gripper_snap)
 
-    async def handler(self, websocket):
-        session = self.new_session()
-        await websocket.send(packb({
-            'policy': type(self.policy).__name__, 'variant': session.model_config.variant, 'action_dim': 23,
-            'action_horizon': session.action_horizon,
-            'n_obs_steps': session.config['n_obs_steps'],
+    def metadata(self, session):
+        """The handshake. BEHAVIOR's NumPy-MessagePack protocol as ACT's b1k_server.py speaks it (`protocol`,
+        `execution_mode`, `chunk_size`): one request per control step, the reply's `action` (B, 23) is executed; the
+        server runs its own plan buffer (`action_horizon` actions of each prediction). Camera and goal views carry the
+        evaluator's names (zed_link, left_realsense_link, right_realsense_link) so the batched client sends the goal
+        images the policy was trained on."""
+        goal_views = [EVALUATOR_CAMERA_NAMES[view] for view in session.goal_views]
+        return {
+            'policy': type(self.policy).__name__, 'protocol': 'behavior-numpy-msgpack', 'variant': session.model_config.variant,
+            'action_dim': 23, 'action_horizon': session.action_horizon, 'chunk_size': session.config['n_action_steps'],
+            'execution_mode': 'chunked', 'temporal_agg': False, 'n_obs_steps': session.config['n_obs_steps'],
+            'horizon': session.config['horizon'], 'proprio_dim': 61, 'observation_keys': OBSERVATION_KEYS,
+            'image_size': session.config['image_size'], 'resize_mode': session.config.get('resize_mode', 'dp'),
+            'cameras': [EVALUATOR_CAMERA_NAMES[camera] for camera in session.config['cameras']],
+            'checkpoint_step': self.checkpoint.get('step'),
             'language_conditioning': session.model_config.language_conditioning,
             'prompt_source': session.model_config.prompt_source,
             'regime': session.model_config.regime, 'task_onehot': session.model_config.task_onehot,
-            'goal_fusion': session.model_config.goal_fusion, 'goal_views': list(session.goal_views),
+            'task_conditioning': 'onehot' if session.model_config.task_onehot else 'none',
+            'goal_fusion': session.model_config.goal_fusion, 'goal_views': goal_views,
+            'goal_views_internal': list(session.goal_views),
             'goal_observation_keys': [GOAL_OBS_KEYS[view] for view in session.goal_views],
             'goal_source': session.model_config.goal_source if session.goal_views else None,
-            'fixed_goal_views': sorted(session.fixed_goals),
+            'fixed_goal_views': sorted(EVALUATOR_CAMERA_NAMES[view] for view in session.fixed_goals),
+            'action_representation': session.config.get('action_representation', 'absolute'),
+            'normalization': session.config.get('normalization', 'limits'), 'served_actions': 'absolute',
+            'gripper_action_dims': list(GRIPPER_ACTION_DIMS),
+            'gripper_clamp': [-1.0, 1.0] if session.gripper_snap is not None else None,
+            'gripper_snap_threshold': session.gripper_snap,
             'task_map': {str(key): value for key, value in session.task_map.items()},
-        }))
+        }
+
+    async def handler(self, websocket):
+        session = self.new_session()
+        await websocket.send(packb(self.metadata(session)))
         try:
             async for payload in websocket:
                 obs = unpackb(payload)
@@ -250,12 +289,17 @@ def main(argv=None):
     parser.add_argument('--goal-image', action='append', metavar='CAMERA=PATH',
                         help='Goal-conditioned checkpoints: fixed goal image (PNG/JPEG, RGB) for a camera view, used '
                              'when a request carries no goal::<camera key> image; repeat per view')
+    parser.add_argument('--gripper-snap-threshold', type=lambda v: None if v.lower() == 'none' else float(v),
+                        default=DEFAULT_GRIPPER_SNAP, metavar='T',
+                        help='Gripper commands are clamped to [-1, 1] and those above T set to +1 (ACT\'s serving rule; '
+                             'none disables both)')
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     torch.set_num_threads(args.cpu_threads)
     policy, checkpoint = load_policy(args.model_path, args.device)
     server = WebsocketPolicyServer(policy, checkpoint, args.host, args.port,
-                                   args.action_horizon, args.task_name, load_goal_images(args.goal_image))
+                                   args.action_horizon, args.task_name, load_goal_images(args.goal_image),
+                                   args.gripper_snap_threshold)
     asyncio.run(server.run())
 
 

@@ -18,33 +18,76 @@ import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader, Sampler
 
-from diffusion_policy.b1k.dataset import (B1KLeRobotDataset, expand_task_groups, images_to_float, parse_settle_steps,
-                                          resolve_episode_split)
-from diffusion_policy.b1k.model import POLICY_TARGETS, ModelConfig, build_policy, load_checkpoint
-from diffusion_policy.b1k.robot import CAMERAS, GRIPPER_STATES
+from diffusion_policy.b1k.dataset import (NORMALIZATIONS, B1KLeRobotDataset, expand_task_groups, images_to_float,
+                                          parse_settle_steps, resolve_episode_split, resolve_val_split)
+from diffusion_policy.b1k.model import GOAL_STEM_INITS, IMAGE_AUGMENTS, POLICY_TARGETS, ModelConfig, build_policy, load_checkpoint
+from diffusion_policy.b1k.robot import (ACTION_REPRESENTATIONS, CAMERAS, GRIPPER_STATES, RESIZE_MODES, absolute_actions,
+                                        goal_key, proprio_dim, task_family)
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 
 
 class StepBatchSampler(Sampler):
-    """O(batch_size) frame-uniform sampling, exactly addressable across resume."""
+    """O(batch_size) frame-uniform sampling, exactly addressable across resume.
 
-    def __init__(self, length, batch_size, start_step, max_steps, seed, loader_batch_size=None):
+    `batch_size` is the global optimizer batch: every step draws it from SeedSequence([seed, step]) and, under DDP
+    (`world_size` > 1), rank `rank` yields its contiguous slice of `batch_size / world_size` samples, in chunks of
+    `loader_batch_size` (one loader task each).
+    """
+
+    def __init__(self, length, batch_size, start_step, max_steps, seed, loader_batch_size=None, rank=0, world_size=1):
+        if world_size < 1 or not 0 <= rank < world_size or batch_size % world_size:
+            raise ValueError(f'Invalid rank {rank} / world_size {world_size} for batch size {batch_size}')
         self.length, self.batch_size = length, batch_size
         self.start_step, self.max_steps, self.seed = start_step, max_steps, seed
-        self.loader_batch_size = loader_batch_size or batch_size
+        self.rank, self.world_size = rank, world_size
+        self.rank_batch_size = batch_size // world_size
+        self.loader_batch_size = loader_batch_size or self.rank_batch_size
 
     def __iter__(self):
+        lo = self.rank * self.rank_batch_size
         for step in range(self.start_step, self.max_steps):
             rng = np.random.default_rng(np.random.SeedSequence([self.seed, step]))
-            indices = rng.integers(self.length, size=self.batch_size).tolist()
-            for start in range(0, self.batch_size, self.loader_batch_size):
+            indices = rng.integers(self.length, size=self.batch_size).tolist()[lo:lo + self.rank_batch_size]
+            for start in range(0, self.rank_batch_size, self.loader_batch_size):
                 yield indices[start:start + self.loader_batch_size]
 
     def __len__(self):
-        chunks = (self.batch_size + self.loader_batch_size - 1) // self.loader_batch_size
+        chunks = (self.rank_batch_size + self.loader_batch_size - 1) // self.loader_batch_size
         return max(0, self.max_steps - self.start_step) * chunks
+
+
+class LossModule(torch.nn.Module):
+    """`policy.compute_loss` as a forward, so DistributedDataParallel can hook the policy's gradients."""
+
+    def __init__(self, policy):
+        super().__init__()
+        self.policy = policy
+
+    def forward(self, batch):
+        return self.policy.compute_loss(batch)
+
+
+def distributed_env():
+    """(rank, local_rank, world_size) from torchrun's environment (0, 0, 1 outside it)."""
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    rank = int(os.environ.get('RANK', '0'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError(f'Invalid RANK={rank} / WORLD_SIZE={world_size}')
+    return rank, local_rank, world_size
+
+
+def stop_requested(stop_file, device, distributed):
+    """Whether `stop_file` exists on any rank; under DDP every rank gets the same answer (one all-reduce)."""
+    if stop_file is None:
+        return False
+    flag = torch.tensor(float(Path(stop_file).exists()), device=device)
+    if distributed:
+        import torch.distributed as dist
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
 
 
 def concatenate_batches(batches):
@@ -309,9 +352,14 @@ def conditioning_record(config, task_map, dataset_root=None, episodes=None, epis
 
 def selection_record(dataset, args):
     """Training data selection saved with full and evaluation checkpoints; resume rebuilds and compares it."""
-    return {'task_names': list(dataset.task_map.values()), 'max_episodes': args.max_episodes,
-            'episode_indices': [row['episode_index'] for row in dataset.episodes], 'episode_split': args.episode_split,
-            'settle_steps': dataset.settle}
+    record = {'task_names': list(dataset.task_map.values()), 'max_episodes': args.max_episodes,
+              'episode_indices': [row['episode_index'] for row in dataset.episodes], 'episode_split': args.episode_split,
+              'settle_steps': dataset.settle}
+    if getattr(args, 'val_split', None):  # the held-out episodes of an ACT-comparable run (absent otherwise)
+        record['val_split'] = args.val_split
+    if getattr(dataset, 'frame_cache_formats', ()):
+        record['frame_cache_formats'] = sorted(dataset.frame_cache_formats)
+    return record
 
 
 def save_checkpoint(output, policy, ema, optimizer, lr_scheduler, config, dataset, step, args):
@@ -381,6 +429,141 @@ def gpu_memory_metrics(device):
     return {'gpu_allocated_bytes': torch.cuda.memory_allocated(device),
             'gpu_reserved_bytes': torch.cuda.memory_reserved(device),
             'gpu_peak_allocated_bytes': torch.cuda.max_memory_allocated(device)}
+
+
+def validation_batches(length, val_batches, val_batch_size, seed):
+    """The index lists of the validation batches: fixed draws (seed, batch) over the validation sequences, the same at
+    every validation of a run (and across runs with the same split and seed)."""
+    batches = []
+    for index in range(val_batches):
+        rng = np.random.default_rng(np.random.SeedSequence([int(seed), 1_000_003, index]))
+        batches.append(rng.integers(length, size=val_batch_size).tolist())
+    return batches
+
+
+@torch.no_grad()
+def evaluate_validation(policy, val_dataset, config, args, device, autocast, attention, rank=0, world_size=1):
+    """Held-out metrics of the EMA policy on the validation split, logged per `--val-every` steps:
+
+    - val/loss: the denoising MSE of fixed-seed noise and timesteps on the validation batches;
+    - val/l1: L1 between the denoised full-horizon trajectory (`predict_action`, matched initial noise) and the recorded
+      actions in normalized units, over the steps inside the episode (edge-padded steps left out);
+    - val/l1_action_units[/<family>]: the same L1 after decoding both to absolute actions in action units (relative
+      actions added to the current state's reference), overall and per task family -- ACT's `val/l1_action_units`;
+    - val/goal_l1_own, val/goal_l1_other, val/goal_gap, val/goal_max_dpred (goal-conditioned policies, the first
+      `--val-goal-batches` batches): the normalized L1 with the sample's own goal image and with the goal of another
+      validation episode of the same task, gap = other - own, and the largest prediction change (normalized units);
+    - timing/val_s.
+    Under DDP each rank evaluates the batches with index % world_size == rank and the sums are all-reduced. The RNG
+    states and the policy's mode are restored afterwards.
+    """
+    import torch.distributed as dist
+    started = time.monotonic()
+    cuda = device.type == 'cuda'
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = torch.cuda.get_rng_state(device).clone() if cuda else None
+    was_training = policy.training
+    goal_pairs = {goal_key(view): view for view in config.goal_views} if config.goal_fusion != 'none' else {}
+    family_of = {int(task): task_family(name) for task, name in val_dataset.task_map.items()}
+    families = sorted(set(family_of.values()))
+    by_task = {}
+    for position, episode in enumerate(val_dataset.episodes):
+        by_task.setdefault(int(episode['task_index']), []).append(position)
+    batches = validation_batches(len(val_dataset), args.val_batches, args.val_batch_size, args.seed)
+    mine = [(index, indices) for index, indices in enumerate(batches) if index % world_size == rank]
+    loader = DataLoader(val_dataset, batch_sampler=[indices for _, indices in mine], num_workers=0, pin_memory=cuda)
+    # sums: loss, loss count, l1 sum, l1 count, units sum, units count, per family (units sum, count), goal own, goal
+    # other, goal count, goal max dpred
+    sums = torch.zeros(10 + 2 * len(families), dtype=torch.float64, device=device)
+    normalizer = policy.normalizer['action']
+    proprio = proprio_dim(config.gripper_state)
+    To = config.n_obs_steps
+    try:
+        policy.eval()
+        for (batch_index, _), batch in zip(mine, loader):
+            meta = batch.pop('meta')
+            valid = batch.pop('action_valid').to(device)
+            batch = dict_apply(batch, lambda value: value.to(device, non_blocking=True))
+            batch['obs'] = images_to_float(batch['obs'])
+            target = batch['action']
+            torch.manual_seed(args.seed + batch_index)
+            if cuda:
+                torch.cuda.manual_seed(args.seed + batch_index)
+            with attention(), autocast:
+                loss = policy.compute_loss({'obs': dict(batch['obs']), 'action': target})
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f'Non-finite validation loss in batch {batch_index}')
+            sums[0] += float(loss)
+            sums[1] += 1
+            torch.manual_seed(args.seed)
+            if cuda:
+                torch.cuda.manual_seed(args.seed)
+            with attention(), autocast:
+                prediction = policy.predict_action(dict(batch['obs']))['action_pred'].float()
+            mask = valid.unsqueeze(-1).float()
+            n_pred = normalizer.normalize(prediction)
+            n_target = normalizer.normalize(target.float())
+            sums[2] += float(((n_pred - n_target).abs() * mask).sum())
+            sums[3] += float(mask.sum()) * target.shape[-1]
+            # action units: both decoded to absolute actions (relative ones with the current state's reference)
+            state = batch['obs']['state'][:, To - 1, :proprio].float().cpu().numpy().astype(np.float64)
+            pred_np, target_np = prediction.cpu().numpy().astype(np.float64), target.float().cpu().numpy().astype(np.float64)
+            if config.action_representation == 'relative':
+                pred_np, target_np = absolute_actions(pred_np, state), absolute_actions(target_np, state)
+            error = np.abs(pred_np - target_np) * valid.cpu().numpy()[..., None]
+            per_sample = error.sum((1, 2))
+            counts = valid.cpu().numpy().sum(1) * target.shape[-1]
+            sums[4] += float(per_sample.sum())
+            sums[5] += float(counts.sum())
+            tasks = meta['task'].tolist()
+            for sample, task in enumerate(tasks):
+                slot = 10 + 2 * families.index(family_of[int(task)])
+                sums[slot] += float(per_sample[sample])
+                sums[slot + 1] += float(counts[sample])
+            if goal_pairs and batch_index < args.val_goal_batches:
+                rng = np.random.default_rng(np.random.SeedSequence([int(args.seed), 7, batch_index]))
+                episodes = meta['episode'].tolist()
+                swapped = dict(batch['obs'])
+                for key, view in goal_pairs.items():
+                    column = list(val_dataset.goal_views).index(view)
+                    others = []
+                    for task, position in zip(tasks, episodes):
+                        candidates = [p for p in by_task[int(task)] if p != position] or [position]
+                        others.append(val_dataset.goal_table[int(rng.choice(candidates)), column])
+                    goals = torch.from_numpy(np.ascontiguousarray(np.moveaxis(np.stack(others), -1, 1))).to(device)
+                    swapped[key] = images_to_float(goals)
+                torch.manual_seed(args.seed)
+                if cuda:
+                    torch.cuda.manual_seed(args.seed)
+                with attention(), autocast:
+                    other = policy.predict_action(swapped)['action_pred'].float()
+                n_other = normalizer.normalize(other)
+                sums[6] += float(((n_pred - n_target).abs() * mask).sum())
+                sums[7] += float(((n_other - n_target).abs() * mask).sum())
+                sums[8] += float(mask.sum()) * target.shape[-1]
+                sums[9] = max(float(sums[9]), float(((n_pred - n_other).abs() * mask).max()))
+    finally:
+        policy.train(was_training)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state(cuda_rng, device)
+    if world_size > 1:
+        peak = sums[9].clone()
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+        sums[9] = peak
+    if cuda:
+        torch.cuda.synchronize(device)
+    s = sums.tolist()
+    metrics = {'val/loss': s[0] / max(1, s[1]), 'val/l1': s[2] / max(1, s[3]), 'val/l1_action_units': s[4] / max(1, s[5])}
+    if len(families) > 1:
+        for index, family in enumerate(families):
+            metrics[f'val/l1_action_units/{family}'] = s[10 + 2 * index] / max(1, s[11 + 2 * index])
+    if goal_pairs and s[8] > 0:
+        metrics.update({'val/goal_l1_own': s[6] / s[8], 'val/goal_l1_other': s[7] / s[8],
+                        'val/goal_gap': (s[7] - s[6]) / s[8], 'val/goal_max_dpred': s[9]})
+    metrics['timing/val_s'] = time.monotonic() - started
+    return metrics
 
 
 class ExplicitLanguageChoice(argparse.Action):
@@ -550,7 +733,38 @@ def parser():
                         help='Late fusion: encode the goal with the camera\'s own encoder (default) or a separate copy')
     result.add_argument('--language-on-goal-encoder', action=argparse.BooleanOptionalAction, default=False,
                         help='Late fusion with clip_film: also FiLM-modulate the goal pass (default: identity FiLM)')
+    result.add_argument('--goal-stem-init', default='zero', action=ExplicitChoice, metavar='zero|random|copy:SCALE',
+                        help='Early fusion: the goal half of the paired stem starts at zero (default), at a fresh '
+                             'nn.Conv2d draw, or as the camera stem\'s weights times SCALE (ACT\'s copy:0.5)')
     result.add_argument('--max-episodes', type=int, help='Explicit small-data smoke/debug subset')
+    # --- the ACT-comparable recipe (b1k.md "ACT-comparable recipe"): pixels, actions, augmentation, validation, DDP ---
+    result.add_argument('--resize-mode', choices=RESIZE_MODES, default='dp', action=ExplicitChoice,
+                        help='dp (default): aspect-preserving cv2 letterbox; act: ACT\'s whole-frame antialiased '
+                             'bilinear resize -- required with an ACT-built --frame-cache (act_b1k_frame_cache_v1), '
+                             'so served frames and goal frames match the cached pixels')
+    result.add_argument('--action-representation', choices=ACTION_REPRESENTATIONS, default='absolute', action=ExplicitChoice,
+                        help='absolute (default): the recorded commands; relative: joints and grippers relative to the '
+                             'current state (ACT / openpi pi05 gripper deltas), decoded back at serving time')
+    result.add_argument('--normalization', choices=NORMALIZATIONS, default='limits', action=ExplicitChoice,
+                        help='limits (default): min/max to [-1, 1]; zscore; quantile: pi05\'s (x - q01) / (q99 - q01 + '
+                             '1e-6) * 2 - 1 over the training episodes (actions: every valid chunk step)')
+    result.add_argument('--image-augment', choices=IMAGE_AUGMENTS, default='none', action=ExplicitChoice,
+                        help='pi05: openpi pi05_b1k\'s training augmentation on the GPU (crop 95%% + resize + rotate '
+                             '+-5 deg + color jitter for the head and its goal, color jitter for the wrists; one draw per '
+                             'sample shared over the observation steps); training batches only; needs no --crop-shape')
+    result.add_argument('--val-fraction', type=float, default=None,
+                        help='Hold out this fraction of each task\'s episodes for validation (ACT\'s per-task seeded '
+                             'split, --seed; default 0.1 when --val-every > 0, else 0); 0 trains on everything')
+    result.add_argument('--val-every', type=int, default=0,
+                        help='Validate the EMA policy on the held-out episodes every N optimizer steps (ACT-comparable '
+                             'runs: 10000; 0, the default, disables validation)')
+    result.add_argument('--val-batches', type=int, default=16, help='Validation batches per validation')
+    result.add_argument('--val-batch-size', type=int, default=64)
+    result.add_argument('--val-goal-batches', type=int, default=2,
+                        help='Goal-conditioned policies: validation batches that also run the goal-swap probe')
+    result.add_argument('--stop-file', type=Path,
+                        help='Stop cleanly when this file exists: a full checkpoint is saved and the trainer exits 0 '
+                             '(every DDP rank agrees through an all-reduce)')
     return result
 
 
@@ -580,9 +794,29 @@ def resolve_regime(args):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    rank, local_rank, world_size = distributed_env()
     device = torch.device(args.device)
     if device.type not in ('cpu', 'cuda'):
         raise ValueError('--device must be cpu, cuda or an indexed CUDA device')
+    if world_size > 1:
+        if device.type == 'cuda':
+            if device.index is not None:
+                raise ValueError('Under torchrun give --device cuda; each rank takes its LOCAL_RANK device')
+            device = torch.device(f'cuda:{local_rank}')
+            torch.cuda.set_device(device)
+        if args.batch_size % world_size:
+            raise ValueError(f'--batch-size ({args.batch_size}) must be divisible by WORLD_SIZE ({world_size})')
+        if (args.batch_size // world_size) % args.grad_accumulation:
+            raise ValueError('--grad-accumulation must divide each rank\'s share of the batch')
+    args.rank, args.local_rank, args.world_size = rank, local_rank, world_size
+    if args.val_every < 0 or args.val_batches < 1 or args.val_batch_size < 1 or args.val_goal_batches < 0:
+        raise ValueError('--val-every and --val-goal-batches must be nonnegative, --val-batches and --val-batch-size positive')
+    if args.val_fraction is None:
+        args.val_fraction = 0.1 if args.val_every > 0 else 0.0
+    if not 0.0 <= args.val_fraction < 1.0:
+        raise ValueError('--val-fraction must be in [0, 1)')
+    if args.val_every > 0 and args.val_fraction == 0.0:
+        raise ValueError('--val-every needs a validation split: --val-fraction > 0 (or --val-every 0)')
     if (min(args.max_steps, args.batch_size, args.save_every, args.cpu_threads,
             args.worker_cpu_threads, args.prefetch_factor, args.video_max_open) < 1 or
             min(args.num_workers, args.save_total_limit, args.export_every) < 0):
@@ -610,10 +844,24 @@ def main(argv=None):
     output = Path(args.output_dir).resolve()
     if output.is_relative_to(Path(args.dataset_path).resolve()):
         raise ValueError('--output-dir must not be inside the read-only dataset')
-    with output_lock(output):
-        if any(path.name != 'run.lock' for path in output.iterdir()) and args.resume is None:
-            raise FileExistsError(f'Output directory is nonempty: {output}; use --resume or a new directory')
-        run_training(args, device, output)
+    distributed = world_size > 1
+    if distributed:
+        import torch.distributed as dist
+        dist.init_process_group('nccl' if device.type == 'cuda' else 'gloo', rank=rank, world_size=world_size,
+                                timeout=__import__('datetime').timedelta(hours=2))
+    try:
+        if rank == 0:
+            with output_lock(output):
+                if any(path.name != 'run.lock' for path in output.iterdir()) and args.resume is None:
+                    raise FileExistsError(f'Output directory is nonempty: {output}; use --resume or a new directory')
+                run_training(args, device, output)
+        else:
+            run_training(args, device, output)
+    finally:
+        if distributed:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.destroy_process_group()
 
 
 def run_training(args, device, output):
@@ -652,6 +900,14 @@ def run_training(args, device, output):
         if getattr(args, 'settle_steps_explicit', False) and args.settle_steps != saved_settle:
             raise ValueError(f'--settle-steps {args.settle_steps} conflicts with the resumed checkpoint ({saved_settle})')
         args.settle_steps = saved_settle
+        for key in ('resize_mode', 'action_representation', 'normalization', 'image_augment', 'goal_stem_init'):
+            if getattr(args, f'{key}_explicit', False) and getattr(args, key) != getattr(config, key):
+                raise ValueError(f'--{key.replace("_", "-")} {getattr(args, key)} conflicts with the resumed checkpoint '
+                                 f'({getattr(config, key)})')
+        val_split = checkpoint['selection'].get('val_split')
+        if val_split is not None and args.val_fraction and (
+                abs(val_split['val_fraction'] - args.val_fraction) > 1e-9 or val_split['seed'] != args.seed):
+            raise ValueError('--val-fraction / --seed differ from the resumed checkpoint\'s validation split')
         for key, value in {'optimizer': 'adamw', 'betas': (0.9, 0.999), 'obs_encoder_weight_decay': 1e-6,
                            # Checkpoints predating these options trained with a constant learning rate,
                            # EMA power 2/3 and gradient clipping at 1.0.
@@ -669,15 +925,25 @@ def run_training(args, device, output):
             if values[key] is not None:
                 values[key] = tuple(values[key])
         config = ModelConfig(**values, clip_sample=not args.no_clip_sample)
+        # the per-task held-out episodes (ACT's split: the same episodes for every policy at this seed)
+        val_split = resolve_val_split(args.dataset_path, args.task_names, split, args.val_fraction, args.seed)
     args.episode_split = split
-    if split:
+    args.val_split = val_split
+    rank, world_size = getattr(args, 'rank', 0), getattr(args, 'world_size', 1)
+    if split and rank == 0:
         print(json.dumps({'episode_split': {'name': split['name'], 'file': split['file'],
                                             'episodes': len(split['episodes']), 'tasks': split['tasks']}}), flush=True)
+    if val_split and rank == 0:
+        print(json.dumps({'val_split': {'val_fraction': val_split['val_fraction'], 'seed': val_split['seed'],
+                                        'train_episodes': len(val_split['train_episodes']),
+                                        'val_episodes': len(val_split['val_episodes']), 'tasks': len(val_split['tasks'])}}),
+              flush=True)
     config.validate()
     args.variant = config.variant
     args.language_conditioning = config.language_conditioning
     args.prompt_source = config.prompt_source
-    for key in ('regime', 'goal_fusion', 'goal_source', 'goal_encoder'):
+    for key in ('regime', 'goal_fusion', 'goal_source', 'goal_encoder', 'resize_mode', 'action_representation',
+                'normalization', 'image_augment', 'goal_stem_init'):
         if checkpoint and getattr(args, f'{key}_explicit', False) and getattr(args, key) != getattr(config, key):
             raise ValueError(f'--{key.replace("_", "-")} conflicts with the resumed checkpoint')
         setattr(args, key, getattr(config, key))
@@ -688,32 +954,53 @@ def run_training(args, device, output):
         raise ValueError('--optimizer upstream requires a transformer variant')
     if checkpoint and checkpoint['step'] >= args.max_steps:
         raise ValueError(f'--max-steps is a total target and must exceed checkpoint step {checkpoint["step"]}')
-    wandb_run = initialize_wandb(args, output, checkpoint, config)
-    dataset = None
+    distributed = world_size > 1
+    is_main = rank == 0
+    wandb_run = initialize_wandb(args, output, checkpoint, config) if is_main else None
+    dataset = val_dataset = None
     exit_code = 1
     try:
         random.seed(args.seed)
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
-        dataset = B1KLeRobotDataset(
-            args.dataset_path, args.task_names, **config.dataset_kwargs(),
-            episode_cache_size=args.episode_cache_size, parquet_cache_mb=args.parquet_cache_mb,
-            max_episodes=args.max_episodes, image_dtype='uint8', frame_cache=args.frame_cache,
-            video_max_open=args.video_max_open, episodes=split['episodes'] if split else None,
-            settle_steps=args.settle_steps)
+        train_episodes = val_split['train_episodes'] if val_split else (split['episodes'] if split else None)
+        dataset_kwargs = dict(config.dataset_kwargs(), episode_cache_size=args.episode_cache_size,
+                              parquet_cache_mb=args.parquet_cache_mb, image_dtype='uint8', frame_cache=args.frame_cache,
+                              video_max_open=args.video_max_open, settle_steps=args.settle_steps)
+        dataset = B1KLeRobotDataset(args.dataset_path, args.task_names, max_episodes=args.max_episodes,
+                                    episodes=train_episodes, **dataset_kwargs)
         if checkpoint and (dataset.task_map != checkpoint['task_map'] or
                            [row['episode_index'] for row in dataset.episodes] != checkpoint['selection']['episode_indices'] or
                            dataset.fingerprint() != checkpoint['dataset_fingerprint']):
             raise ValueError('Resume dataset selection, metadata or file fingerprint does not match checkpoint')
         dataset.prepare_language(checkpoint.get('language') if checkpoint else None)
-        print(json.dumps({'episodes': len(dataset.episodes), 'sequences': len(dataset),
-                          'task_map': dataset.task_map, 'config': config.to_dict()}), flush=True)
+        if val_split and args.val_every > 0:
+            val_dataset = B1KLeRobotDataset(args.dataset_path, args.task_names, episodes=val_split['val_episodes'],
+                                            return_meta=True, **dataset_kwargs)
+            if val_dataset.task_map != dataset.task_map:
+                raise ValueError('The validation episodes do not cover the training tasks')
+            if config.language_conditioning == 'clip_film':
+                val_dataset.prepare_language(dataset.language)
+        if is_main:
+            print(json.dumps({'episodes': len(dataset.episodes), 'sequences': len(dataset),
+                              'val_episodes': len(val_dataset.episodes) if val_dataset else 0,
+                              'val_sequences': len(val_dataset) if val_dataset else 0,
+                              'frame_cache_formats': sorted(dataset.frame_cache_formats),
+                              'task_map': dataset.task_map, 'config': config.to_dict()}), flush=True)
         policy = build_policy(config, dataset.task_map, initialize_encoder=checkpoint is None)
         if checkpoint:
             policy.load_state_dict(checkpoint['model'])
         else:
-            print('Computing exact selected-frame limits, streaming parquet once per file (no video).', flush=True)
-            policy.set_normalizer(dataset.get_normalizer())
+            if is_main:
+                print(f'Computing {config.normalization} normalization statistics of {config.action_representation} '
+                      'actions, streaming parquet once per file (no video).', flush=True)
+                policy.set_normalizer(dataset.get_normalizer(config.normalization))
+            if distributed:  # rank 0's statistics for every rank (the same bytes, computed once)
+                import torch.distributed as dist
+                payload = [policy.normalizer.state_dict() if is_main else None]
+                dist.broadcast_object_list(payload, src=0)
+                if not is_main:
+                    policy.normalizer.load_state_dict(payload[0])
         if args.film_init == 'identity':
             if config.language_conditioning != 'clip_film':
                 raise ValueError('--film-init identity requires --language-conditioning clip_film')
@@ -727,10 +1014,19 @@ def run_training(args, device, output):
             for module in policy.modules():
                 if isinstance(module, ResNet18FiLM):
                     module.checkpoint_blocks = False
-        policy.to(args.device).train()
+        policy.to(device).train()
         if config.freeze_encoder:
             policy.obs_encoder.eval().requires_grad_(False)
         policy.normalizer.requires_grad_(False)
+        for name, parameter in policy.named_parameters():
+            if name.rpartition('.')[2] == '_dummy_variable' and parameter.numel() == 0:
+                # ModuleAttrMixin's device/dtype probes: empty, never trained; DDP would wait for their gradients
+                parameter.requires_grad_(False)
+        if distributed:  # rank 0's initial weights for every rank (a fresh start draws them per process)
+            import torch.distributed as dist
+            for tensor in policy.state_dict().values():
+                if torch.is_tensor(tensor) and tensor.numel():
+                    dist.broadcast(tensor, src=0)
         ema = EMAModel(copy.deepcopy(policy), power=args.ema_power)
         ema_updater = EMAUpdater(ema, policy) if args.multi_tensor_ema else None
         optimizer = build_optimizer(policy, args)
@@ -752,9 +1048,18 @@ def run_training(args, device, output):
             numpy_rng = checkpoint['rng']['numpy']
             np.random.set_state((numpy_rng[0], numpy_rng[1].numpy().astype(np.uint32), *numpy_rng[2:]))
             random.setstate(checkpoint['rng']['python'])
-            if checkpoint['rng']['cuda'] is not None and device.type == 'cuda':
+            if checkpoint['rng']['cuda'] is not None and device.type == 'cuda' and not distributed:
                 torch.cuda.set_rng_state_all(checkpoint['rng']['cuda'])
             del checkpoint
+        if distributed and (rank > 0 or step):
+            # the saved RNG state is rank 0's; every other rank (and rank 0's CUDA stream under DDP) takes its own seed
+            torch.manual_seed(args.seed + 1_000 * (step + 1) + rank)
+            if device.type == 'cuda':
+                torch.cuda.manual_seed(args.seed + 1_000 * (step + 1) + rank)
+        elif distributed:
+            torch.manual_seed(args.seed + rank)
+            if device.type == 'cuda':
+                torch.cuda.manual_seed(args.seed + rank)
         torch.set_float32_matmul_precision(args.matmul_precision)
         torch.backends.cudnn.benchmark = args.cudnn_benchmark
         if args.compile != 'none':
@@ -762,27 +1067,40 @@ def run_training(args, device, output):
             # nor the Inductor cache key includes the backend flags; keep the artifacts apart.
             torch.compiler.config.cache_key_tag = f'b1k-sdpa-{args.sdpa_backend}'
             compile_policy(policy, args.compile)
+        trainer = LossModule(policy)
+        if distributed:
+            from torch.nn.parallel import DistributedDataParallel
+            trainer = DistributedDataParallel(trainer, device_ids=[device.index] if device.type == 'cuda' else None,
+                                              broadcast_buffers=False, find_unused_parameters=False)
         autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.autocast == 'bf16')
         attention = (partial(sdpa_kernel, [SDPBackend.MATH]) if args.sdpa_backend == 'math'
                      else contextlib.nullcontext)
-        # The sampler draws the optimizer batch per step exactly as without accumulation; the loader delivers
-        # it in micro-batches (one worker task each unless --loader-batch-size subdivides them further).
-        micro_batch = args.batch_size // args.grad_accumulation
+        goal_pairs = {goal_key(view): view for view in config.goal_views} if config.goal_fusion != 'none' else {}
+        augment = config.image_augment == 'pi05'
+        if augment:
+            from diffusion_policy.b1k.augment import augment_obs
+        # The sampler draws the global optimizer batch per step exactly as without accumulation; each rank's loader
+        # delivers its share in micro-batches (one worker task each unless --loader-batch-size subdivides them further).
+        rank_batch = args.batch_size // world_size
+        micro_batch = rank_batch // args.grad_accumulation
         loader = DataLoader(
             dataset, batch_sampler=StepBatchSampler(len(dataset), args.batch_size, step, args.max_steps,
-                                                    args.seed, args.loader_batch_size or micro_batch),
+                                                    args.seed, args.loader_batch_size or micro_batch, rank, world_size),
             num_workers=args.num_workers, pin_memory=device.type == 'cuda',
             worker_init_fn=partial(seed_worker, cpu_threads=args.worker_cpu_threads),
-            generator=torch.Generator().manual_seed(args.seed),
+            generator=torch.Generator().manual_seed(args.seed + rank),
             **({'multiprocessing_context': 'spawn', 'prefetch_factor': args.prefetch_factor} if args.num_workers else {}))
-        (output / 'config.json').write_text(json.dumps({
-            'model': config.to_dict(), 'tasks': dataset.task_map, 'training': vars(args), 'settle_steps': dataset.settle,
-            'conditioning': conditioning_record(config, dataset.task_map, dataset.root, len(dataset.episodes), split,
-                                                dataset.settle)},
-            indent=2, default=str))
+        if is_main:
+            (output / 'config.json').write_text(json.dumps({
+                'model': config.to_dict(), 'tasks': dataset.task_map, 'training': vars(args), 'settle_steps': dataset.settle,
+                'val_split': val_split,
+                'conditioning': conditioning_record(config, dataset.task_map, dataset.root, len(dataset.episodes), split,
+                                                    dataset.settle)},
+                indent=2, default=str))
         if device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats(device)
-        with (output / 'train.jsonl').open('a') as log:
+        stopped = False
+        with (output / 'train.jsonl').open('a') if is_main else contextlib.nullcontext() as log:
             start = wait_start = time.monotonic()
             data_wait_s = compute_s = 0.0
             micro_losses = []
@@ -790,12 +1108,18 @@ def run_training(args, device, output):
             for batch in training_batches(loader, micro_batch):
                 compute_start = time.monotonic()
                 data_wait_s += compute_start - wait_start
-                batch = dict_apply(batch, lambda value: value.to(args.device, non_blocking=True))
+                batch = dict_apply(batch, lambda value: value.to(device, non_blocking=True))
                 # Images travel as uint8; this reproduces the float32 [0, 1] values bit for bit.
                 batch['obs'] = images_to_float(batch['obs'])
-                with attention():
+                if augment:  # training batches only, in [0, 1], before the policy's normalizer; one draw per micro-batch
+                    batch['obs'] = augment_obs(batch['obs'], config.cameras, goal_pairs, args.seed, step,
+                                               rank * args.grad_accumulation + len(micro_losses),
+                                               compiled=device.type == 'cuda' and args.compile != 'none')
+                last_micro = len(micro_losses) == args.grad_accumulation - 1
+                sync = trainer.no_sync() if distributed and not last_micro else contextlib.nullcontext()
+                with sync, attention():
                     with autocast:
-                        loss = policy.compute_loss(batch)
+                        loss = trainer(batch)
                     # Equal micro-batches: the summed gradient equals that of the full-batch mean loss.
                     (loss / args.grad_accumulation if args.grad_accumulation > 1 else loss).backward()
                 # Checked after backward so the CPU can enqueue it without a device sync in between.
@@ -820,7 +1144,12 @@ def run_training(args, device, output):
                 # Upstream EMA updates parameters only, not BatchNorm running statistics.
                 sync_batchnorm_buffers(policy, ema.averaged_model)
                 step += 1
-                loss_value = (torch.stack(micro_losses).sum() / len(micro_losses)).item()
+                loss_tensor = torch.stack(micro_losses).sum() / len(micro_losses)
+                if distributed:  # the step's loss over the whole global batch
+                    import torch.distributed as dist
+                    dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                    loss_tensor /= world_size
+                loss_value = loss_tensor.item()
                 grad_value = float(grad_norm)
                 optimizer.zero_grad(set_to_none=True)
                 micro_losses = []
@@ -828,31 +1157,49 @@ def run_training(args, device, output):
                     torch.cuda.synchronize(device)
                 compute_s += time.monotonic() - compute_start
                 checkpoint_start = time.monotonic()
-                if args.export_every and step % args.export_every == 0:
-                    path = export_checkpoint(output, ema, config, dataset.task_map, step, dataset.language,
-                                             selection_record(dataset, args))
-                    print(f'Evaluation export: {path}', flush=True)
-                if step % args.save_every == 0 or step == args.max_steps or (args.save_first_step and step == 1):
-                    path = save_checkpoint(output, policy, ema, optimizer, lr_scheduler, config, dataset, step, args)
-                    print(f'Checkpoint: {path}', flush=True)
-                record = {'step': step, 'loss': loss_value, 'grad_norm': grad_value,
-                          'elapsed_s': time.monotonic() - start, 'data_wait_s': data_wait_s,
-                          'compute_s': compute_s, 'step_s': data_wait_s + compute_s,
-                          'checkpoint_s': time.monotonic() - checkpoint_start,
-                          'samples_per_s': args.batch_size / (data_wait_s + compute_s),
-                          'learning_rate': learning_rate, **gpu_memory_metrics(device)}
-                print(json.dumps(record), flush=True)
-                log.write(json.dumps(record) + '\n')
-                log.flush()
-                if wandb_run is not None:
-                    wandb_run.log(record, step=step)
+                stopped = stop_requested(args.stop_file, device, distributed)
+                validation = {}
+                if val_dataset is not None and args.val_every and (step % args.val_every == 0 or stopped or step == args.max_steps):
+                    validation = evaluate_validation(ema.averaged_model, val_dataset, config, args, device, autocast,
+                                                     attention, rank, world_size)
+                if is_main:
+                    if args.export_every and step % args.export_every == 0:
+                        path = export_checkpoint(output, ema, config, dataset.task_map, step, dataset.language,
+                                                 selection_record(dataset, args))
+                        print(f'Evaluation export: {path}', flush=True)
+                    if (step % args.save_every == 0 or step == args.max_steps or (args.save_first_step and step == 1)
+                            or stopped):
+                        path = save_checkpoint(output, policy, ema, optimizer, lr_scheduler, config, dataset, step, args)
+                        print(f'Checkpoint: {path}', flush=True)
+                    record = {'step': step, 'loss': loss_value, 'grad_norm': grad_value,
+                              'elapsed_s': time.monotonic() - start, 'data_wait_s': data_wait_s,
+                              'compute_s': compute_s, 'step_s': data_wait_s + compute_s,
+                              'checkpoint_s': time.monotonic() - checkpoint_start,
+                              'samples_per_s': args.batch_size / (data_wait_s + compute_s),
+                              'learning_rate': learning_rate, **gpu_memory_metrics(device), **validation}
+                    if stopped:
+                        record['stopped'] = True
+                    print(json.dumps(record), flush=True)
+                    log.write(json.dumps(record) + '\n')
+                    log.flush()
+                    if wandb_run is not None:
+                        wandb_run.log(record, step=step)
                 del grad_norm
                 data_wait_s = compute_s = 0.0
                 wait_start = time.monotonic()
+                if stopped:
+                    if is_main:
+                        print(f'Stop file {args.stop_file}: stopped after saving step {step}', flush=True)
+                    break
+        if distributed:  # ranks leave together (rank 0 may still be writing the last checkpoint)
+            import torch.distributed as dist
+            dist.barrier()
         exit_code = 0
     finally:
         if dataset is not None:
             dataset.close()
+        if val_dataset is not None:
+            val_dataset.close()
         if wandb_run is not None:
             wandb_run.finish(exit_code=exit_code)
 

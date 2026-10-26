@@ -425,3 +425,53 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python scripts/b1k/serve_b1k.py \
 It served the resumed checkpoint for health, handshake, real parquet/video RGB/RGBA observations, replan, independent clients, no-reply reset, and batch-size checks. Independent wire verification exercised an 11-step action/replanning sequence plus reset, batching, and reconnect requests with the existing OpenPi codec, including unseen-task rejection. The reviewer stopped the server after verification, and GPU 1 was idle on the final check. Independent review also checked actual episodes 199, 8401, and 19692 at first/last frame, including six-hour packed-video offsets; all-task metadata (20,000 episodes, 100 tasks), partial roots, and full-task statistics.
 
 This is a **nonconverged functionality smoke**, not a performance or task-success claim. Simulator evaluation is unavailable on this GB300 host because OmniGibson/BEHAVIOR requires RTX rendering support. Use a supported RTX evaluation machine connected to this policy server; the network checks do not establish simulator success. Stop the server after evaluation; no service is installed.
+
+## ACT-comparable recipe (branch `isg-todo1-goal`, 2026-10-26)
+
+Goal-image early vs. late fusion under the data, pixels, actions and augmentation of the ACT run
+`act-isg1020-multitask5-relq-late-piaug-ddp4-bs1024-s0` (kmy17518/act `isg-wave2-dev-todo1-side-piaug` @ 8da77eb), with
+ACT-comparable offline metrics and serving in `ispatialgym-eval-vec`'s batched evaluator. Everything below is opt-in:
+checkpoints and commands from before the branch behave as they did (`tests/test_b1k*.py` unchanged and passing).
+
+- **ACT's frame cache** (`--frame-cache DIR --resize-mode act`): `FrameCacheReader` reads `act_b1k_frame_cache_v1`
+  entries (the 1.59 TB 224 x 224 cache the ACT runs built), so no DP cache is rebuilt. `--resize-mode act` is ACT's
+  `preprocess_image` (whole-frame antialiased bilinear resize, rounded to uint8; `robot.resize_rgb_act`) and is required
+  with such a cache (a `dp`-mode run is refused with the hint): goal frames (`episode_last`, the last *recorded* frame,
+  also under `--settle-steps`) and served frames then carry the cached pixels; frames already at the training size (the
+  evaluator resizes and quantizes on its side) pass through unchanged. `scripts/b1k/build_frame_cache.py --resize-mode act`
+  builds ACT-format entries. The mode is in `ModelConfig.resize_mode` and in the serving handshake.
+- **`--image-augment pi05`** (`diffusion_policy/b1k/augment.py`, a port of ACT's `b1k_augment.py`): openpi pi05_b1k's
+  training augmentation on the GPU in [0, 1] before the normalizer, training batches only. One geometric + color draw per
+  sample for the head camera's `n_obs_steps` frames and its goal image, one color draw per sample for both wrists' frames;
+  draws from (seed, step, rank * grad_accumulation + micro-batch); torch.compile'd with `--compile`. Requires no
+  `--crop-shape` (DP's CropRandomizer would crop twice and misalign current/goal). `tests/test_b1k_isg.py` checks every
+  observation step against ACT's `pi05_augment` with the same draws (atol 2e-6).
+- **relq**: `--action-representation relative` (joints and grippers relative to the current frame's state, the gripper
+  reference `20 * opening - 1`, base velocities absolute; `robot.relative_actions` / `absolute_actions`) and
+  `--normalization quantile` (pi05's `(x - q01) / (q99 - q01 + 1e-6) * 2 - 1`, `SingleFieldLinearNormalizer` scale /
+  offset, q01 / q99 saved in `input_stats`) or `zscore`; statistics over the training episodes' kept frames (state) and
+  every valid horizon step of every frame's chunk relative to that frame (actions), as ACT's; dims narrower than 0.02 are
+  widened (`QUANTILE_MIN_RANGE`). Serving decodes a relative plan with the state it was predicted from, then clamps the
+  gripper commands to [-1, 1] and snaps those above 0.9 to +1 (`--gripper-snap-threshold`, ACT's rule).
+- **Validation split and metrics**: `--val-fraction 0.1 --seed 0` is ACT's `resolve_val_split` (per task,
+  SeedSequence([seed, sha256(task)]): on multitask5 the same 4,856 train / 536 val episodes as ACT and openpi, tested
+  against the real metadata). `--val-every N` evaluates the EMA policy on fixed validation batches: `val/loss`
+  (denoising MSE), `val/l1` (denoised trajectory vs. recorded actions, normalized units, edge padding left out),
+  `val/l1_action_units[/<family>]` (both decoded to absolute actions in action units: ACT's metric), and for
+  goal-conditioned policies the held-out goal probe `val/goal_l1_own`, `val/goal_l1_other` (the goal of another
+  validation episode of the same task), `val/goal_gap`, `val/goal_max_dpred`. Rows go to train.jsonl and W&B.
+- **DDP and `--stop-file`**: `torchrun --standalone --nproc_per_node=N -m diffusion_policy.b1k.train ...` with
+  `--batch-size` the global batch (each rank its slice of the same seeded draw), gradients averaged by
+  DistributedDataParallel, rank 0's normalizer and initial weights broadcast, validation sharded over the ranks,
+  rank 0 logging / checkpointing. `--stop-file PATH`: every rank agrees (all-reduce), a full checkpoint is saved and the
+  trainer exits 0. `--goal-stem-init zero|random|copy:SCALE` exposes the paired stem's goal half (early fusion).
+- **Serving**: the handshake carries `protocol: behavior-numpy-msgpack`, `execution_mode: chunked`, `chunk_size`,
+  `goal_views` in the evaluator's camera names (`zed_link`, ...; `goal_views_internal` keeps `head`), `resize_mode`,
+  `action_representation`, `gripper_snap_threshold`; `ispatialgym-eval-vec`'s `detect_protocol` classifies it as the
+  ACT protocol, and `eval_worker.py` serves units of kind `dp` (code root `dp-isg`, `ISG_DP_PYTHON`).
+
+The two buildbox runs (`isg-buildbox-coord` `manual/train_dp.sh`): `dp-isg1020-multitask5-relq-{early,late}-piaug-ddp4-bs1024-s0`
+= multitask5 (53 tasks), `--episode-split auto --settle-steps 0 --gripper-state sum --no-task-onehot --regime image
+--goal-views head --goal-source episode_last`, 12 x 512 `transformer_hybrid_image`, horizon 16 / 2 observation steps / 8
+action steps, 224 x 224 from ACT's cache, DDPM 100, AdamW 1e-4 wd 1e-6 constant, EMA power 2/3, clip 1.0, global batch
+1024, 200k steps, save / export / validate every 10k, bf16 autocast, TF32, `--compile default`, seed 0, W&B offline.

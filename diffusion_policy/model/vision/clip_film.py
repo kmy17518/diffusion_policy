@@ -63,18 +63,28 @@ class PairedConv2d(nn.Conv2d):
     """Stem convolution accepting a camera image channel-stacked with its goal image (goal-image early fusion).
 
     For a 6-channel `[current; goal]` input it computes `conv(current) + conv_goal(goal)`: one 6-channel
-    convolution with weights `[W_obs, W_goal]` (BridgeData V2's channel stacking). `goal_weight` starts at zero, so
-    at initialization the paired stem equals the plain stem and a zero goal is an exact "absent goal"; 3-channel
-    inputs run the plain convolution. State-dict keys stay `weight`/`bias` plus `goal_weight`.
+    convolution with weights `[W_obs, W_goal]` (BridgeData V2's channel stacking). `goal_weight` starts at zero
+    (`goal_init='zero'`), so at initialization the paired stem equals the plain stem and a zero goal is an exact
+    "absent goal"; `'random'` draws it like nn.Conv2d's weight; `'copy:SCALE'` copies the camera stem's weights times
+    SCALE (ACT's --goal-stem-init copy:0.5: the goal enters through the same filters as the current image from the
+    first step). 3-channel inputs run the plain convolution. State-dict keys stay `weight`/`bias` plus `goal_weight`.
     """
-    def __init__(self, conv):
+    def __init__(self, conv, goal_init='zero'):
         super().__init__(conv.in_channels, conv.out_channels, conv.kernel_size, conv.stride, conv.padding,
                          conv.dilation, conv.groups, conv.bias is not None, conv.padding_mode)
         with torch.no_grad():
             self.weight.copy_(conv.weight)
             if conv.bias is not None:
                 self.bias.copy_(conv.bias)
-        self.goal_weight = nn.Parameter(torch.zeros_like(self.weight))
+        if goal_init == 'zero':
+            goal_weight = torch.zeros_like(self.weight)
+        elif goal_init == 'random':
+            goal_weight = nn.Conv2d(conv.in_channels, conv.out_channels, conv.kernel_size, bias=False).weight.detach().clone()
+        elif goal_init.startswith('copy:'):
+            goal_weight = self.weight.detach().clone() * float(goal_init.split(':', 1)[1])
+        else:
+            raise ValueError(f'goal_init must be zero, random or copy:SCALE, got {goal_init!r}')
+        self.goal_weight = nn.Parameter(goal_weight)
 
     def forward(self, x):
         if x.shape[1] == self.in_channels:
@@ -99,13 +109,14 @@ class FiLMResidualBlock(nn.Module):
 
 class ResNet18FiLM(nn.Module):
     """ResNet18 (GroupNorm by default) with optional per-block FiLM, optional paired stem, hybrid spatial-softmax head."""
-    def __init__(self, group_norm=True, weights=None, spatial_shape=None, film=True, paired_stem=False):
+    def __init__(self, group_norm=True, weights=None, spatial_shape=None, film=True, paired_stem=False,
+                 goal_stem_init='zero'):
         super().__init__()
         backbone = get_resnet('resnet18', weights=weights)
         if group_norm:
             replace_submodules(backbone, lambda module: isinstance(module, nn.BatchNorm2d),
                                lambda module: nn.GroupNorm(module.num_features // 16, module.num_features))
-        conv1 = PairedConv2d(backbone.conv1) if paired_stem else backbone.conv1
+        conv1 = PairedConv2d(backbone.conv1, goal_stem_init) if paired_stem else backbone.conv1
         self.stem = nn.Sequential(conv1, backbone.bn1, backbone.relu, backbone.maxpool)
         self.blocks = nn.ModuleList(FiLMResidualBlock(block, film) for layer in (
             backbone.layer1, backbone.layer2, backbone.layer3, backbone.layer4) for block in layer)
@@ -159,10 +170,11 @@ class SpatialSoftmax(nn.Module):
 class FiLMHybridObsEncoder(nn.Module):
     def __init__(self, shape_meta, crop_shape=None, group_norm=True, eval_fixed_crop=True, language=True,
                  goal_keys=(), goal_pairs=None, goal_fusion='none', goal_encoder='shared_base',
-                 language_on_goal_encoder=False):
+                 language_on_goal_encoder=False, goal_stem_init='zero'):
         """
         goal_keys: observation keys holding goal images ((B, 3, H, W), no history axis), excluded from the base
             feature layout; goal_pairs maps each goal key to the camera key it is the goal of.
+        goal_stem_init (early fusion): the goal half of the paired stem, see PairedConv2d.
         """
         super().__init__()
         if goal_fusion not in GOAL_FUSIONS or goal_encoder not in GOAL_ENCODERS:
@@ -187,7 +199,8 @@ class FiLMHybridObsEncoder(nn.Module):
             if meta.get('type', 'low_dim') == 'rgb':
                 shape = meta['shape']
                 self.encoders[key] = ResNet18FiLM(group_norm=group_norm, spatial_shape=crop_shape or shape[1:],
-                                                  film=language, paired_stem=key in paired_cameras)
+                                                  film=language, paired_stem=key in paired_cameras,
+                                                  goal_stem_init=goal_stem_init)
                 if crop_shape is not None and tuple(crop_shape) != tuple(shape[1:]):
                     self.crops[key] = CropRandomizer(shape, *crop_shape)
                 self.feature_dim += GOAL_FEATURE_DIM

@@ -6,8 +6,11 @@ import importlib
 import torch
 from diffusers import DDIMScheduler, DDPMScheduler
 
-from diffusion_policy.b1k.robot import CAMERAS, GRIPPER_STATES, goal_key, proprio_dim
-from diffusion_policy.b1k.dataset import GOAL_SOURCES
+from diffusion_policy.b1k.robot import ACTION_REPRESENTATIONS, CAMERAS, GRIPPER_STATES, RESIZE_MODES, goal_key, proprio_dim
+from diffusion_policy.b1k.dataset import GOAL_SOURCES, NORMALIZATIONS
+
+IMAGE_AUGMENTS = ('none', 'pi05')
+GOAL_STEM_INITS = ('zero', 'random', 'copy')  # copy takes a scale: copy:0.5
 
 
 POLICY_TARGETS = {
@@ -76,6 +79,20 @@ class ModelConfig:
     # Gripper proprioception layout (robot.GRIPPER_STATES). `fingers` (25 values) is the layout of checkpoints that
     # do not record it and therefore the dataclass default; the trainer CLI defaults to `sum` (23 values).
     gripper_state: str = 'fingers'
+    # ISG additions (b1k.md "ACT-comparable recipe"); the defaults are the behavior of checkpoints without the fields.
+    # resize_mode (robot.RESIZE_MODES): dp = aspect-preserving cv2 letterbox; act = ACT's whole-frame antialiased
+    # bilinear resize (the pixels of ACT's 224 x 224 frame caches and serving path).
+    resize_mode: str = 'dp'
+    # action_representation (robot.ACTION_REPRESENTATIONS): absolute commands, or relative to the current state.
+    action_representation: str = 'absolute'
+    # normalization (dataset.NORMALIZATIONS) of the state and the actions: limits (min/max to [-1, 1], the original),
+    # zscore, or pi05's quantile ((x - q01) / (q99 - q01 + 1e-6) * 2 - 1).
+    normalization: str = 'limits'
+    # image_augment (augment.IMAGE_AUGMENTS): openpi pi05_b1k's training image augmentation on the GPU (training only).
+    image_augment: str = 'none'
+    # goal_stem_init: the goal half of the paired stem in early fusion: zero (BridgeData-style, the original), random
+    # (nn.Conv2d initialization) or copy:SCALE (the camera stem's weights times SCALE, ACT's --goal-stem-init copy:0.5).
+    goal_stem_init: str = 'zero'
 
     @property
     def lowdim(self):
@@ -93,10 +110,18 @@ class ModelConfig:
                 'obs_steps': self.obs_steps, 'imagenet_norm': self.imagenet_norm,
                 'language_conditioning': self.language_conditioning, 'prompt_source': self.prompt_source,
                 'task_onehot': self.task_onehot, 'goal_views': self.goal_views if self.goal_fusion != 'none' else (),
-                'goal_source': self.goal_source, 'gripper_state': self.gripper_state}
+                'goal_source': self.goal_source, 'gripper_state': self.gripper_state, 'resize_mode': self.resize_mode,
+                'action_representation': self.action_representation}
 
     def to_dict(self):
         return asdict(self)
+
+    @property
+    def goal_stem_scale(self):
+        """The copy scale of goal_stem_init copy:SCALE (None for zero / random)."""
+        if self.goal_stem_init.startswith('copy:'):
+            return float(self.goal_stem_init.split(':', 1)[1])
+        return None
 
     @property
     def goal_keys(self):
@@ -108,6 +133,28 @@ class ModelConfig:
             raise ValueError(f'Unknown diffusion variant {self.variant!r}')
         if self.gripper_state not in GRIPPER_STATES:
             raise ValueError(f'gripper_state must be one of {GRIPPER_STATES}')
+        if self.resize_mode not in RESIZE_MODES:
+            raise ValueError(f'resize_mode must be one of {RESIZE_MODES}')
+        if self.action_representation not in ACTION_REPRESENTATIONS or self.normalization not in NORMALIZATIONS:
+            raise ValueError(f'action_representation must be one of {ACTION_REPRESENTATIONS} and normalization one of '
+                             f'{NORMALIZATIONS}')
+        if self.action_representation == 'relative' and self.gripper_state != 'sum':
+            raise ValueError('Relative actions need gripper_state sum (one state value per action dimension)')
+        if self.action_representation == 'relative' and self.normalization == 'limits':
+            raise ValueError('Relative actions need normalization zscore or quantile')
+        if self.image_augment not in IMAGE_AUGMENTS:
+            raise ValueError(f'image_augment must be one of {IMAGE_AUGMENTS}')
+        if self.image_augment != 'none':
+            if self.lowdim:
+                raise ValueError('image_augment needs image observations')
+            if self.crop_shape is not None and tuple(self.crop_shape) != (self.image_size, self.image_size):
+                raise ValueError('image_augment pi05 replaces the random crop: leave crop_shape unset (or equal to the '
+                                 'image size) so images are not cropped twice and goals stay aligned')
+        stem = self.goal_stem_init
+        if not (stem in ('zero', 'random') or (stem.startswith('copy:') and _is_float(stem[5:]))):
+            raise ValueError(f'goal_stem_init must be zero, random or copy:SCALE, got {stem!r}')
+        if stem != 'zero' and self.goal_fusion != 'early':
+            raise ValueError('goal_stem_init applies to early goal fusion')
         if self.regime not in (None, 'none', 'language', 'image', 'image_language'):
             raise ValueError(f'Unknown regime {self.regime!r}')
         if self.goal_fusion not in ('none', 'early', 'late') or self.goal_encoder not in ('shared_base', 'separate_base'):
@@ -198,6 +245,14 @@ class ModelConfig:
         if self.variant != 'unet_image' and (self.encoder_weights or self.freeze_encoder or self.imagenet_norm
                 or self.resize_shape is not None or not self.share_rgb_model or not self.random_crop):
             raise ValueError('Pretrained/resize/share/normalization encoder controls apply only to unet_image')
+
+
+def _is_float(text):
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
 
 
 def build_policy(config, task_map, initialize_encoder=True):
@@ -310,7 +365,8 @@ def build_policy(config, task_map, initialize_encoder=True):
             shape_meta, crop_shape=config.crop_shape, group_norm=config.obs_encoder_group_norm,
             eval_fixed_crop=config.eval_fixed_crop, language=config.language_conditioning == 'clip_film',
             goal_keys=config.goal_keys, goal_pairs=goal_pairs, goal_fusion=config.goal_fusion,
-            goal_encoder=config.goal_encoder, language_on_goal_encoder=config.language_on_goal_encoder)
+            goal_encoder=config.goal_encoder, language_on_goal_encoder=config.language_on_goal_encoder,
+            goal_stem_init=config.goal_stem_init)
         common['goal_keys'] = config.goal_keys
         common['goal_fusion'] = config.goal_fusion
     hybrid = dict(crop_shape=config.crop_shape, obs_encoder_group_norm=config.obs_encoder_group_norm,

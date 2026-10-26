@@ -19,8 +19,17 @@ import pyarrow.parquet as pq
 import torch
 
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
-from diffusion_policy.b1k.robot import (CAMERAS, GOAL_VIDEO_KEYS, GRIPPER_STATES, condition_state, extract_state, goal_key,
-                                        proprio_dim, resize_rgb)
+from diffusion_policy.b1k.robot import (ACTION_DELTA, ACTION_REPRESENTATIONS, CAMERAS, GOAL_VIDEO_KEYS, GRIPPER_STATES,
+                                        RESIZE_MODES, action_reference, condition_state, extract_state, goal_key,
+                                        proprio_dim, relative_actions, resize_rgb)
+
+NORMALIZATIONS = ('limits', 'zscore', 'quantile')
+QUANTILE_EPS = 1e-6  # openpi's (ACT's QUANTILE_EPS)
+# Dimensions whose q99 - q01 is narrower are normalized over this range around their center instead (a constant state
+# or a near-constant relative torso command would otherwise blow noise up by 1 / (q99 - q01)); ACT's QUANTILE_MIN_RANGE.
+QUANTILE_MIN_RANGE = 0.02
+ZSCORE_STD_FLOOR = 0.01  # ACT's std floor
+VAL_SPLIT_FORMAT = 'isg-val-split/v1'
 
 GOAL_SOURCES = ('episode_last', 'goal_key')
 EPISODE_SPLIT_FORMAT = 'isg-episode-split/v1'
@@ -47,7 +56,9 @@ class EpisodeSequenceIndex:
     def __len__(self):
         return int(self.ends[-1]) if len(self.ends) else 0
 
-    def locate(self, index):
+    def locate(self, index, with_valid=False):
+        """(episode position, clipped frame indices) of sequence `index`; with `with_valid` also the mask of the steps
+        that lie inside the episode (False = edge padding, the frame repeated)."""
         if index < 0:
             index += len(self)
         if not 0 <= index < len(self):
@@ -55,7 +66,10 @@ class EpisodeSequenceIndex:
         episode = int(np.searchsorted(self.ends, index, side='right'))
         previous = int(self.ends[episode - 1]) if episode else 0
         start = index - previous - self.pad_before
-        frames = np.clip(np.arange(start, start + self.horizon), 0, self.lengths[episode] - 1)
+        unclipped = np.arange(start, start + self.horizon)
+        frames = np.clip(unclipped, 0, self.lengths[episode] - 1)
+        if with_valid:
+            return episode, frames, (unclipped >= 0) & (unclipped < self.lengths[episode])
         return episode, frames
 
 
@@ -85,11 +99,12 @@ class VideoReader:
     MP4 costs ~5 ms (index parse + stream probe), more than decoding a short GOP.
     """
 
-    def __init__(self, image_size, tolerance=0.008, max_open=32, cache_frames=64):
+    def __init__(self, image_size, tolerance=0.008, max_open=32, cache_frames=64, resize_mode='dp'):
         self.image_size = image_size
         self.tolerance = tolerance
         self.max_open = max_open
         self.cache_frames = cache_frames
+        self.resize_mode = resize_mode
         self.containers = OrderedDict()
         self.frames = OrderedDict()
 
@@ -133,7 +148,7 @@ class VideoReader:
                 timestamp = float(frame.pts * stream.time_base)
                 matches = [t for t in pending if abs(timestamp - t) <= self.tolerance]
                 if matches:
-                    image = resize_rgb(frame.to_ndarray(format='rgb24'), self.image_size)
+                    image = resize_rgb(frame.to_ndarray(format='rgb24'), self.image_size, self.resize_mode)
                     for t in matches:
                         decoded[(path, t)] = image
                         pending.remove(t)
@@ -292,7 +307,7 @@ class B1KLeRobotDataset(BaseImageDataset):
                  obs_steps=None, imagenet_norm=False, language_conditioning='none',
                  prompt_source='task_name', task_onehot=True, image_dtype='float32', frame_cache=None,
                  video_max_open=32, goal_views=(), goal_source='episode_last', episodes=None, settle_steps='all',
-                 gripper_state='sum'):
+                 gripper_state='sum', resize_mode='dp', action_representation='absolute', return_meta=False):
         """
         goal_views / goal_source (goal-image conditioning): for every camera in `goal_views` (a subset of `cameras`)
         each sample also carries `goal_<camera>`, one (3, S, S) image for the whole episode with no observation-
@@ -310,10 +325,30 @@ class B1KLeRobotDataset(BaseImageDataset):
         `iter_lowdim` and the fingerprint cover the kept frames only.
 
         gripper_state (see robot.GRIPPER_STATES): proprioception layout of the state and of the normalizer.
+
+        resize_mode (robot.RESIZE_MODES): how decoded frames are resized to image_size (`dp`: aspect-preserving cv2
+        letterbox; `act`: ACT's whole-frame antialiased bilinear resize, the pixels of ACT's frame caches). A frame
+        cache must hold pixels of the same mode.
+
+        action_representation (robot.ACTION_REPRESENTATIONS): `relative` returns each sample's actions relative to the
+        state of its current frame (observation step n_obs_steps - 1; `robot.relative_actions`, needs gripper_state
+        `sum`); the state itself stays absolute. `absolute` returns the recorded commands.
+
+        return_meta: samples also carry `action_valid` (horizon,) -- False at edge-padded steps -- and `meta`
+        {'task': task_index, 'episode': position in self.episodes, 'frame': current frame} for validation.
         """
         if gripper_state not in GRIPPER_STATES:
             raise ValueError(f'Unknown gripper_state {gripper_state!r}; expected one of {GRIPPER_STATES}')
+        if resize_mode not in RESIZE_MODES:
+            raise ValueError(f'Unknown resize_mode {resize_mode!r}; expected one of {RESIZE_MODES}')
+        if action_representation not in ACTION_REPRESENTATIONS:
+            raise ValueError(f'Unknown action_representation {action_representation!r}; expected one of {ACTION_REPRESENTATIONS}')
+        if action_representation == 'relative' and gripper_state != 'sum':
+            raise ValueError('Relative actions need gripper_state sum (one state value per action dimension)')
         self.gripper_state = gripper_state
+        self.resize_mode = resize_mode
+        self.action_representation = action_representation
+        self.return_meta = bool(return_meta)
         self.root = Path(dataset_path).resolve()
         self.goal_views = tuple(goal_views or ())
         if goal_source not in GOAL_SOURCES:
@@ -462,9 +497,11 @@ class B1KLeRobotDataset(BaseImageDataset):
             n_action_steps - 1 if pad_after is None else pad_after)
         if not len(self.sampler):
             raise ValueError('No sequences for this horizon and padding')
+        self.frame_cache_formats = set()
         if self.frame_cache is not None:
             from diffusion_policy.b1k.frame_cache import FrameCacheReader
-            FrameCacheReader(self.frame_cache, self.root, self.image_size).validate(
+            self.frame_cache_formats = FrameCacheReader(
+                self.frame_cache, self.root, self.image_size, resize_mode=self.resize_mode).validate(
                 {self.video_path(row, camera) for row in self.episodes for camera in self.cameras})
         self._reset_cache()
         if self.goal_views:
@@ -485,7 +522,8 @@ class B1KLeRobotDataset(BaseImageDataset):
         """
         started = time.perf_counter()
         table = np.empty((len(self.episodes), len(self.goal_views), self.image_size, self.image_size, 3), dtype=np.uint8)
-        reader = VideoReader(self.image_size, max_open=self.video_max_open) if self.goal_source == 'goal_key' else self._video
+        reader = (VideoReader(self.image_size, max_open=self.video_max_open, resize_mode=self.resize_mode)
+                  if self.goal_source == 'goal_key' else self._video)
         for position, episode in enumerate(self.episodes):
             for view, camera in enumerate(self.goal_views):
                 if self.goal_source == 'episode_last':
@@ -518,9 +556,9 @@ class B1KLeRobotDataset(BaseImageDataset):
         self._row_group_bytes = 0
         if self.frame_cache is not None:
             from diffusion_policy.b1k.frame_cache import FrameCacheReader
-            self._video = FrameCacheReader(self.frame_cache, self.root, self.image_size)
+            self._video = FrameCacheReader(self.frame_cache, self.root, self.image_size, resize_mode=self.resize_mode)
         else:
-            self._video = VideoReader(self.image_size, max_open=self.video_max_open)
+            self._video = VideoReader(self.image_size, max_open=self.video_max_open, resize_mode=self.resize_mode)
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -613,10 +651,14 @@ class B1KLeRobotDataset(BaseImageDataset):
         return result
 
     def __getitem__(self, index):
-        position, frames = self.sampler.locate(index)
+        position, frames, valid = self.sampler.locate(index, with_valid=True)
         episode = self.episodes[position]
         data = self._read_episode(episode)
         obs_frames = frames[:self.obs_steps]
+        current = int(frames[self.n_obs_steps - 1])  # the current frame: the last observation step
+        actions = data['action'][frames]
+        if self.action_representation == 'relative':
+            actions = relative_actions(actions, data['state'][current])
         state = condition_state(data['state'][obs_frames],
                                 np.full(len(obs_frames), episode['task_index']), self.task_map, self.task_onehot)
         obs = {'state': torch.from_numpy(state)}
@@ -645,8 +687,12 @@ class B1KLeRobotDataset(BaseImageDataset):
                 obs[camera] = torch.from_numpy(np.ascontiguousarray(images))
             else:
                 obs[camera] = torch.from_numpy(images.astype(np.float32) / 255.)
-        return {'obs': obs['state'] if self.observation_mode == 'lowdim' else obs,
-                'action': torch.from_numpy(data['action'][frames].copy())}
+        sample = {'obs': obs['state'] if self.observation_mode == 'lowdim' else obs,
+                  'action': torch.from_numpy(np.ascontiguousarray(actions, dtype=np.float32))}
+        if self.return_meta:
+            sample['action_valid'] = torch.from_numpy(valid.copy())
+            sample['meta'] = {'task': int(episode['task_index']), 'episode': int(position), 'frame': current}
+        return sample
 
     def iter_lowdim(self, batch_size=65536):
         """Stream each selected packed file once; no image decoding or frame index allocation."""
@@ -680,10 +726,109 @@ class B1KLeRobotDataset(BaseImageDataset):
             payload['gripper_state'] = self.gripper_state
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
-    def get_normalizer(self, **kwargs):
-        from diffusion_policy.b1k.normalization import fit_normalizer
+    def iter_episode_lowdim(self):
+        """Every selected episode's kept frames in frame order: (episode row, state (L, D) `extract_state` layout,
+        action (L, 23)) -- the per-episode view the chunk statistics of `compute_action_stats` need."""
+        by_file = defaultdict(list)
+        for episode in self.episodes:
+            by_file[self.data_path(episode)].append(episode)
+        columns = ['episode_index', 'frame_index', 'observation.state', 'action']
+        for path, episodes in by_file.items():
+            ids = np.array([episode['episode_index'] for episode in episodes], dtype=np.int64)
+            table = pq.read_table(path, columns=columns)
+            table = table.filter(pc.is_in(table['episode_index'], value_set=pa.array(ids)))
+            index = table['episode_index'].to_numpy()
+            frame = table['frame_index'].to_numpy()
+            order = np.lexsort((frame, index))
+            index, frame = index[order], frame[order]
+            state = extract_state(_matrix(table['observation.state'])[order], self.gripper_state)
+            action = _matrix(table['action'])[order]
+            bounds = np.searchsorted(index, ids, side='left'), np.searchsorted(index, ids, side='right')
+            for episode, lo, hi in zip(episodes, *bounds):
+                kept = episode['length']
+                if hi - lo < kept or not np.array_equal(frame[lo:lo + kept], np.arange(kept)):
+                    raise ValueError(f'Episode {episode["episode_index"]} frames in {path} disagree with its metadata')
+                yield episode, state[lo:lo + kept], action[lo:lo + kept]
+
+    def compute_action_stats(self, normalization, log=print):
+        """Per-dimension statistics of the state (every kept frame) and of the actions as the trainer sees them -- every
+        valid step k of every frame's horizon-long chunk, `action[t + k]` (k < horizon, t + k < kept length), taken
+        relative to the state of frame t when the representation is relative (ACT's `compute_normalization_stats`
+        with chunk_size = horizon; edge-padded steps are left out) -- for `zscore` (mean, sample std floored at
+        ZSCORE_STD_FLOOR) or `quantile` (exact linear q01 / q99, dims narrower than QUANTILE_MIN_RANGE widened around
+        their center as ACT does); min / max / mean / std always. Streams each packed file once; the chunk values of all
+        23 action dimensions are held in memory (float32, 23 x valid steps)."""
+        if normalization not in ('zscore', 'quantile'):
+            raise ValueError(f'compute_action_stats serves zscore or quantile, not {normalization!r}')
+        relative = self.action_representation == 'relative'
+        horizon = self.horizon
+        lengths = np.array([row['length'] for row in self.episodes], dtype=np.int64)
+        total_frames = int(lengths.sum())
+        total_steps = int(sum(min(horizon, length - t) for length in lengths.tolist() for t in range(length)))
+        state_dim = proprio_dim(self.gripper_state)
+        states = np.empty((state_dim, total_frames), dtype=np.float32)
+        values = np.empty((23, total_steps), dtype=np.float32)
+        f = s = 0
+        started = time.perf_counter()
+        for episode, state, action in self.iter_episode_lowdim():
+            length = len(action)
+            states[:, f:f + length] = state.T
+            f += length
+            reference = action_reference(state) if relative else None
+            for k in range(min(horizon, length)):
+                chunk = action[k:].astype(np.float64)
+                if relative:
+                    chunk = chunk - reference[:length - k]
+                values[:, s:s + length - k] = chunk.T.astype(np.float32)
+                s += length - k
+        if f != total_frames or s != total_steps:
+            raise ValueError(f'Statistics covered {f} frames / {s} chunk steps, metadata declares {total_frames} / {total_steps}')
+        if total_frames < 2 or total_steps < 2:
+            raise ValueError('At least two frames are required for normalization statistics')
+        if not (np.isfinite(states).all() and np.isfinite(values).all()):
+            raise ValueError('Non-finite state/action statistics')
+
+        def moments(matrix):
+            matrix64 = matrix.astype(np.float64)
+            return {'min': matrix64.min(axis=1), 'max': matrix64.max(axis=1), 'mean': matrix64.mean(axis=1),
+                    'std': np.maximum(matrix64.std(axis=1, ddof=1), ZSCORE_STD_FLOOR)}
+        stats = {'method': normalization, 'action_representation': self.action_representation, 'horizon': horizon,
+                 'count': total_frames, 'action_count': total_steps, 'state': moments(states), 'action': moments(values)}
+        if normalization == 'quantile':
+            stats.update(quantile_eps=QUANTILE_EPS, min_range=QUANTILE_MIN_RANGE, guarded={})
+            for kind, matrix in (('state', states), ('action', values)):
+                q01 = np.array([linear_quantile(matrix[dim], 0.01) for dim in range(len(matrix))])
+                q99 = np.array([linear_quantile(matrix[dim], 0.99) for dim in range(len(matrix))])
+                g01, g99, guarded = guard_quantiles(q01, q99, QUANTILE_MIN_RANGE)
+                stats[kind].update(q01=g01, q99=g99, q01_raw=q01, q99_raw=q99)
+                stats['guarded'][kind] = guarded
+                if guarded:
+                    log(f'WARNING: quantile statistics: {kind} dims {guarded} have q99 - q01 < {QUANTILE_MIN_RANGE}; '
+                        f'normalized over {QUANTILE_MIN_RANGE} around their centers')
+        if self.task_onehot:  # the one-hot task suffix of the state keeps its literal values (identity statistics)
+            n = len(self.task_map)
+            identity = {'min': 0.0, 'max': 1.0, 'mean': 0.0, 'std': 1.0, 'q01': 0.0, 'q99': 1.0, 'q01_raw': 0.0, 'q99_raw': 1.0}
+            for key, value in list(stats['state'].items()):
+                stats['state'][key] = np.concatenate([np.asarray(value, dtype=np.float64), np.full(n, identity[key])])
+        if relative:
+            stats['action_delta'] = json.loads(json.dumps(ACTION_DELTA))
+        log(f'{normalization} statistics of {self.action_representation} actions: {total_frames} frames, {total_steps} '
+            f'valid chunk steps in {time.perf_counter() - started:.1f}s')
+        return stats
+
+    def get_normalizer(self, normalization='limits', **kwargs):
+        from diffusion_policy.b1k.normalization import fit_normalizer, normalizer_from_stats
         from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
-        normalizer = fit_normalizer(self.iter_lowdim(), self.cameras, proprio_dim(self.gripper_state))
+        if normalization not in NORMALIZATIONS:
+            raise ValueError(f'Unknown normalization {normalization!r}; expected one of {NORMALIZATIONS}')
+        if normalization == 'limits':
+            if self.action_representation != 'absolute':
+                raise ValueError('Relative actions need --normalization zscore or quantile (their statistics are '
+                                 'computed over chunk steps relative to the current state)')
+            normalizer = fit_normalizer(self.iter_lowdim(), self.cameras, proprio_dim(self.gripper_state))
+        else:
+            normalizer = normalizer_from_stats(self.compute_action_stats(normalization), self.cameras,
+                                               proprio_dim(self.gripper_state), self.task_onehot)
         if self.observation_mode == 'lowdim':
             result = LinearNormalizer()
             result['obs'], result['action'] = normalizer['state'], normalizer['action']
@@ -696,3 +841,56 @@ class B1KLeRobotDataset(BaseImageDataset):
             for camera in self.cameras:
                 normalizer[camera] = SingleFieldLinearNormalizer.create_identity()
         return normalizer
+
+
+def linear_quantile(values, q):
+    """numpy's default (linear) quantile of a 1-D array, from a partial sort of a copy (ACT's `linear_quantiles`)."""
+    values = np.array(values, dtype=np.float64, copy=True)
+    n = len(values)
+    position = q * (n - 1)
+    low, high = int(position), min(int(position) + 1, n - 1)
+    values.partition(sorted({low, high}))
+    return float(values[low] + (position - low) * (values[high] - values[low]))
+
+
+def guard_quantiles(q01, q99, min_range):
+    """(q01, q99, guarded dims): dims with q99 - q01 < min_range get [center - min_range / 2, center + min_range / 2]."""
+    q01, q99 = np.asarray(q01, dtype=np.float64), np.asarray(q99, dtype=np.float64)
+    narrow = q99 - q01 < min_range
+    center = (q01 + q99) / 2
+    return (np.where(narrow, center - min_range / 2, q01), np.where(narrow, center + min_range / 2, q99),
+            np.flatnonzero(narrow).tolist())
+
+
+def resolve_val_split(dataset_path, task_names, episode_split, val_fraction, seed):
+    """Per-task train/val episode split (isg-val-split/v1) when `val_fraction > 0`, else None -- ACT's
+    `b1k_training.resolve_val_split`, so DP, ACT and openpi hold out the same episodes.
+
+    Each task's candidate episodes (from `episode_split` when given, else every episode of the task with local data)
+    are partitioned deterministically with SeedSequence([seed, sha256(task_name)]) into round(N * val_fraction)
+    validation episodes (at least 1, at most N - 1) and the remaining training episodes.
+    """
+    if not val_fraction:
+        return None
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError(f'--val-fraction must be in [0, 1); got {val_fraction}')
+    catalog = B1KLeRobotDataset(dataset_path, task_names, observation_mode='lowdim',
+                                episodes=episode_split['episodes'] if episode_split else None)
+    try:
+        by_task = {}
+        for task_id, task_name in sorted(catalog.task_map.items()):
+            episodes = sorted(int(ep['episode_index']) for ep in catalog.episodes if int(ep['task_index']) == task_id)
+            if len(episodes) < 2:
+                raise ValueError(f'Task {task_name!r} has {len(episodes)} episode(s); at least 2 are required for '
+                                 f'--val-fraction {val_fraction}')
+            n_val = min(len(episodes) - 1, max(1, round(len(episodes) * val_fraction)))
+            task_seed = int.from_bytes(hashlib.sha256(task_name.encode()).digest()[:8], 'little')
+            rng = np.random.default_rng(np.random.SeedSequence([int(seed), task_seed]))
+            perm = [episodes[i] for i in rng.permutation(len(episodes))]
+            by_task[task_name] = {'train': sorted(perm[n_val:]), 'val': sorted(perm[:n_val])}
+    finally:
+        catalog.close()
+    train_episodes = sorted(ep for entry in by_task.values() for ep in entry['train'])
+    val_episodes = sorted(ep for entry in by_task.values() for ep in entry['val'])
+    return {'format': VAL_SPLIT_FORMAT, 'val_fraction': float(val_fraction), 'seed': int(seed),
+            'tasks': by_task, 'train_episodes': train_episodes, 'val_episodes': val_episodes}
