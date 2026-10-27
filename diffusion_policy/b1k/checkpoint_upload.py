@@ -123,15 +123,17 @@ def exclusive_lock(path):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def make_api(http_timeout=120):
-    # The requests backend also bounds HF endpoints that omit a timeout themselves.
+def make_api(http_timeout=120, xet=False):
+    # The requests backend also bounds HF endpoints that omit a timeout themselves. With xet, file contents go through
+    # hf-xet's own client (its retries, not http_timeout); without it, through S3 endpoints that some egress proxies
+    # refuse (the GB300 buildboxes: TLS EOF from hf-hub-lfs-us-east-1.s3-accelerate.amazonaws.com) -- ACT's --xet.
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
-    os.environ['HF_HUB_DISABLE_XET'] = '1'
+    os.environ['HF_HUB_DISABLE_XET'] = '0' if xet else '1'
     os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
     import requests
     from huggingface_hub import HfApi, configure_http_backend, constants
 
-    constants.HF_HUB_DISABLE_XET = True
+    constants.HF_HUB_DISABLE_XET = not xet
     constants.HF_HUB_ENABLE_HF_TRANSFER = False
 
     class BoundedSession(requests.Session):
@@ -149,11 +151,12 @@ class CheckpointUploader:
     """Keep all remote mutations recoverable from an fsynced local journal."""
 
     def __init__(self, run_dir, staging_dir, repo_id, api, *, run_id=None,
-                 max_steps=300000, eval_every=10000, metadata=None):
+                 max_steps=300000, eval_every=10000, metadata=None, public=False):
         self.run_dir = Path(run_dir).resolve()
         self.staging_dir = Path(staging_dir).resolve()
         self.repo_id = repo_id
         self.api = api
+        self.public = public  # a repo this uploader creates is public; an existing repo keeps its visibility
         self.run_id = run_id or self.run_dir.name
         self.max_steps = max_steps
         self.eval_every = eval_every
@@ -324,14 +327,14 @@ class CheckpointUploader:
                 raise SafetyError('Refusing an existing repository without this local ownership journal')
             self.state['phase'] = 'creating'
             self.save()
-            self.api.create_repo(self.repo_id, repo_type='model', private=True, exist_ok=False)
+            self.api.create_repo(self.repo_id, repo_type='model', private=not self.public, exist_ok=False)
             self.state['phase'] = 'created'
             self.save()
         if self.state['phase'] == 'creating':
             try:
                 self.api.repo_info(self.repo_id, repo_type='model')
             except RepositoryNotFoundError:
-                self.api.create_repo(self.repo_id, repo_type='model', private=True, exist_ok=False)
+                self.api.create_repo(self.repo_id, repo_type='model', private=not self.public, exist_ok=False)
                 self.state['phase'] = 'created'
                 self.save()
             else:
@@ -572,6 +575,12 @@ def parser():
     result.add_argument('--metadata', action='append', default=[], metavar='KEY=VALUE')
     result.add_argument('--metadata-json', type=Path)
     result.add_argument('--once', action='store_true')
+    result.add_argument('--xet', action='store_true', default=os.environ.get('B1K_UPLOAD_XET') == '1',
+                        help='Upload file contents with hf-xet instead of plain LFS (S3), for hosts whose egress proxy '
+                             'refuses the S3 endpoints; those transfers are not bounded by --http-timeout. '
+                             'B1K_UPLOAD_XET=1 sets it for launchers that cannot add flags')
+    result.add_argument('--public', action='store_true',
+                        help='Create the repo public (an existing repo keeps its visibility)')
     return result
 
 
@@ -587,11 +596,11 @@ def main(argv=None):
             raise SystemExit('metadata must use KEY=VALUE')
         key, value = item.split('=', 1)
         metadata[key] = value
-    api = make_api(args.http_timeout)
+    api = make_api(args.http_timeout, args.xet)
     try:
         with CheckpointUploader(args.run_dir, args.staging_dir, args.repo_id, api,
                                 run_id=args.run_id, max_steps=args.max_steps,
-                                eval_every=args.eval_every, metadata=metadata) as uploader:
+                                eval_every=args.eval_every, metadata=metadata, public=args.public) as uploader:
             while True:
                 try:
                     complete = uploader.run_once()
