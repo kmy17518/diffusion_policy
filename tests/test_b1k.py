@@ -1054,6 +1054,11 @@ def test_frame_cache_is_pixel_exact_and_validated(root, tmp_path):
     import os
     stat = head.stat()
     os.utime(head, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+    portable = FrameCacheReader(cache, root, 16)
+    portable.read(head, [0.5])
+    portable.close()
+    with head.open('ab') as changed_source:
+        changed_source.write(b'changed-size')
     with pytest.raises(ValueError, match='Stale or mismatched'):
         make_dataset(root, frame_cache=cache)
     with pytest.raises(FileNotFoundError, match='No frame cache entry'):
@@ -1640,7 +1645,7 @@ def test_gripper_state_is_recorded_and_legacy_checkpoints_resume_and_serve(root,
     paths.update(dataset.video_path(row, camera) for row in dataset.episodes for camera in dataset.cameras)
     files = [(str(path.relative_to(dataset.root)), path.stat().st_size, path.stat().st_mtime_ns) for path in sorted(paths)]
     payload = {'info': dataset.info, 'episodes': dataset.episodes, 'tasks': dataset.task_map, 'files': files}
-    assert dataset.fingerprint() == hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    assert dataset.legacy_fingerprint() == hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     assert make_dataset(root).fingerprint() != dataset.fingerprint()
     with pytest.raises(ValueError, match="Unknown gripper_state 'both'"):
         make_dataset(root, gripper_state='both')

@@ -103,6 +103,16 @@ def resize_rgb_act(image, image_size):
     return torch.round(tensor * 255).clamp_(0, 255).to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
 
 
+def action_delta(gripper_action='delta'):
+    if gripper_action not in ('absolute', 'delta'):
+        raise ValueError('gripper_action must be absolute or delta')
+    delta = dict(ACTION_DELTA)
+    if gripper_action == 'absolute':
+        delta['gripper_action_dims'] = []
+        delta['gripper_state_dims'] = []
+    return delta
+
+
 def action_reference(proprio, delta=ACTION_DELTA):
     """What relative actions are taken against (float64, (..., 23)), from `sum`-layout proprioception (..., 23): the
     state on the joint dims, the gripper openings in command units on the gripper dims, zero on the absolute dims

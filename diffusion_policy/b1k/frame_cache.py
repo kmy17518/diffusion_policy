@@ -18,6 +18,9 @@ Layout, mirroring the dataset tree under the cache root (one entry per packed vi
 """
 
 import argparse
+from collections import OrderedDict
+from .b1k_data_core import revision, source_matches
+from .b1k_cache_v2 import ShardedReader, FORMAT as V2_FORMAT
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import multiprocessing
@@ -36,8 +39,8 @@ FORMAT = 'diffusion_policy_b1k_frame_cache_v1'
 # buildboxes serves DP without a rebuild; a DP run reading it must use `resize_mode='act'` (its goal frames and served
 # frames then go through the same resize).
 ACT_FORMAT = 'act_b1k_frame_cache_v1'
-FORMATS = (FORMAT, ACT_FORMAT)
-FORMAT_RESIZE_MODE = {FORMAT: 'dp', ACT_FORMAT: 'act'}
+FORMATS = (FORMAT, ACT_FORMAT, V2_FORMAT)
+FORMAT_RESIZE_MODE = {FORMAT: 'dp', ACT_FORMAT: 'act', V2_FORMAT: 'act'}
 
 
 def cache_stem(cache_root, dataset_root, video_path):
@@ -59,11 +62,12 @@ def manifest_image_size(manifest):
     return size
 
 
-def _manifest_matches(manifest, source, image_size, formats=FORMATS):
-    stat = Path(source).stat()
+def _manifest_matches(manifest, source, image_size, formats=FORMATS, dataset_revision=None):
+    root = Path(source)
+    for _ in Path(manifest.get('source', 'file')).parts:
+        root = root.parent
     return (manifest.get('format') in formats and manifest_image_size(manifest) == image_size
-            and manifest.get('source_size') == stat.st_size
-            and manifest.get('source_mtime_ns') == stat.st_mtime_ns)
+            and source_matches(manifest, source, root, dataset_revision))
 
 
 def entry_is_valid(stem, source, image_size):
@@ -118,6 +122,7 @@ def build_entry(source, stem, image_size, dataset_root, resize_mode='dp'):
         'format': ACT_FORMAT if act else FORMAT, 'image_size': [image_size, image_size] if act else image_size,
         'frames': count, 'source': str(source.resolve().relative_to(Path(dataset_root).resolve())),
         'source_size': stat.st_size, 'source_mtime_ns': stat.st_mtime_ns,
+        'dataset_revision': revision(dataset_root),
         'resize': ('preprocess_image (bilinear, antialias, align_corners=False) then round(x * 255)' if act
                    else 'resize_rgb: cv2.INTER_LINEAR, aspect-preserving, centered zero padding'),
         'decoder': f'PyAV {av.__version__}, libavcodec {av.library_versions.get("libavcodec")}',
@@ -153,13 +158,25 @@ class FrameCacheReader:
         if resize_mode not in (None, 'dp', 'act'):
             raise ValueError(f'resize_mode must be dp, act or None, got {resize_mode!r}')
         self.formats = tuple(f for f in FORMATS if resize_mode is None or FORMAT_RESIZE_MODE[f] == resize_mode)
-        self.entries = {}
-        self.entry_formats = {}
+        self.entries = OrderedDict()
+        self._v2 = None
+        self.dataset_revision = revision(dataset_root)
+        self.entry_formats = OrderedDict()
+        self.seen_formats = set()
+
+    def __getstate__(self):
+        return dict(self.__dict__, entries=OrderedDict(), entry_formats=OrderedDict(), _v2=None)
 
     def close(self):
         self.entries.clear()
+        if self._v2 is not None:
+            self._v2.close()
 
     def _open(self, path):
+        if self._v2 is not None:
+            _, pts, _ = self._v2.open(path)
+            self.seen_formats.add(V2_FORMAT)
+            return None, pts
         entry = self.entries.get(path)
         if entry is None:
             stem = cache_stem(self.cache_root, self.dataset_root, path)
@@ -167,32 +184,47 @@ class FrameCacheReader:
             if not manifest_path.is_file():
                 raise FileNotFoundError(f'No frame cache entry for {path}; build it with scripts/b1k/build_frame_cache.py')
             manifest = json.loads(manifest_path.read_text())
-            if not _manifest_matches(manifest, path, self.image_size, self.formats):
+            if not _manifest_matches(manifest, path, self.image_size, self.formats, self.dataset_revision):
                 if manifest.get('format') in FORMATS and manifest.get('format') not in self.formats:
                     raise ValueError(f'Frame cache entry {manifest_path} holds {manifest["format"]} pixels (resize mode '
                                      f'{FORMAT_RESIZE_MODE[manifest["format"]]}); this run uses resize mode '
                                      f'{[FORMAT_RESIZE_MODE[f] for f in self.formats]}: pass --resize-mode '
                                      f'{FORMAT_RESIZE_MODE[manifest["format"]]} or another --frame-cache')
                 raise ValueError(f'Stale or mismatched frame cache entry {manifest_path}; rebuild it')
+            if manifest.get('format') == V2_FORMAT:
+                if self._v2 is None:
+                    self._v2 = ShardedReader(self.cache_root, self.dataset_root, (self.image_size, self.image_size), self.tolerance)
+                _, pts, _ = self._v2.open(path)
+                self.seen_formats.add(V2_FORMAT)
+                return None, pts
             frames = np.load(frames_path, mmap_mode='r')
-            pts = np.load(pts_path)
+            pts = np.load(pts_path, mmap_mode='r')
             if frames.shape != (manifest['frames'], self.image_size, self.image_size, 3) or frames.dtype != np.uint8 \
                     or pts.shape != (manifest['frames'],):
                 raise ValueError(f'Corrupt frame cache entry {stem}; rebuild it')
             entry = self.entries[path] = (frames, pts)
             self.entry_formats[path] = manifest['format']
+            self.seen_formats.add(manifest['format'])
+            while len(self.entry_formats) > 16:
+                self.entry_formats.popitem(last=False)
+            while len(self.entries) > 16:
+                self.entries.popitem(last=False)
+        self.entries.move_to_end(path)
         return entry
 
     def validate(self, video_paths):
         """Open every entry once (format, size, source match); returns the set of entry formats seen."""
         for path in sorted(str(p) for p in video_paths):
             self._open(path)
-        formats = set(self.entry_formats.values())
+        formats = set(self.seen_formats)
         self.close()
         return formats
 
     def read(self, path, timestamps):
         frames, pts = self._open(str(path))
+        if frames is None:
+            positions = self._v2.positions(path, timestamps)
+            return np.stack([self._v2.read(path, int(p)) for p in positions])
         # Same key rounding and tolerance semantics as VideoReader: the first frame in
         # presentation order within `tolerance` of each requested time.
         timestamps = np.round(np.asarray(timestamps, dtype=np.float64), 6)
@@ -255,6 +287,7 @@ def verify_frame_cache(dataset, cache_root, samples=256, seed=0, log=print):
     cached = FrameCacheReader(cache_root, dataset.root, dataset.image_size, resize_mode=resize_mode)
     rng = np.random.default_rng(seed)
     compared = 0
+    errors, psnrs = [], []
     started = time.monotonic()
     try:
         for index in rng.integers(len(dataset), size=samples):
@@ -268,14 +301,21 @@ def verify_frame_cache(dataset, cache_root, samples=256, seed=0, log=print):
                 path = dataset.video_path(episode, camera)
                 expected = native.read(path, timestamps)
                 actual = cached.read(path, timestamps)
-                if expected.shape != actual.shape or not np.array_equal(expected, actual):
+                if cached._v2 is not None:
+                    diff = expected.astype(np.float64) - actual
+                    errors.append(float(np.abs(diff).max()))
+                    mse = float(np.square(diff).mean())
+                    psnrs.append(float('inf') if mse == 0 else 10*np.log10(255**2/mse))
+                    if psnrs[-1] < 30:
+                        raise ValueError(f'JPEG cache PSNR {psnrs[-1]:.2f} dB is below 30 dB')
+                elif expected.shape != actual.shape or not np.array_equal(expected, actual):
                     raise ValueError(f'Frame cache mismatch: episode {episode["episode_index"]} {camera} {timestamps}')
                 compared += len(timestamps)
     finally:
         native.close()
         cached.close()
     log(f'verified {compared} cached frames from {samples} samples against native decoding in '
-        f'{time.monotonic() - started:.1f}s: identical')
+        f'{time.monotonic() - started:.1f}s: ' + (f'JPEG max abs {max(errors):.0f}, min/mean PSNR {min(psnrs):.2f}/{np.mean(psnrs):.2f} dB' if errors else 'identical'))
     return compared
 
 
@@ -283,6 +323,15 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     result.add_argument('--dataset-path', '--dataset-root', dest='dataset_path', required=True)
     result.add_argument('--cache-dir', required=True)
+    result.add_argument('--format', choices=('v1','v2'), default='v1')
+    result.add_argument('--dataset-revision')
+    result.add_argument('--jpeg-quality', type=int, default=95)
+    result.add_argument('--jpeg-subsampling', type=int, choices=(0,1,2), default=0)
+    result.add_argument('--shard-bytes', type=int, default=2_000_000_000)
+    result.add_argument('--resize-device', default='cpu')
+    result.add_argument('--resize-batch-size', type=int, help='Default: CPU 1; GPU 32')
+    result.add_argument('--decoder-threads', type=int, default=1)
+    result.add_argument('--cpu-budget', type=int, default=len(os.sched_getaffinity(0)))
     result.add_argument('--task-names', nargs='+',
                         help='Tasks or task groups of <dataset>/isg_meta/task_groups.json (default: every local task)')
     result.add_argument('--cameras', choices=list(CAMERAS), nargs='+', default=list(CAMERAS))
@@ -298,12 +347,35 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.dataset_revision:
+        os.environ['B1K_DATASET_REVISION'] = args.dataset_revision
+    if args.format == 'v2' and args.resize_mode != 'act':
+        raise ValueError('v2 requires --resize-mode act')
     from diffusion_policy.b1k.dataset import B1KLeRobotDataset, expand_task_groups
     dataset = B1KLeRobotDataset(args.dataset_path, expand_task_groups(args.dataset_path, args.task_names),
                                 cameras=tuple(args.cameras), image_size=args.image_size,
                                 max_episodes=args.max_episodes, resize_mode=args.resize_mode)
     try:
-        build_frame_cache(dataset, args.cache_dir, workers=args.workers)
+        if args.format == 'v2':
+            from .b1k_cache_v2 import build_group
+            from functools import partial
+            groups = {}
+            for path in selected_videos(dataset):
+                groups.setdefault(path.parent, []).append(path)
+            workers = min(args.workers, len(groups))
+            if workers * args.decoder_threads > args.cpu_budget:
+                raise ValueError('workers * decoder-threads exceeds --cpu-budget')
+            build = partial(build_group, cache_root=args.cache_dir, dataset_root=dataset.root,
+                            image_size=(dataset.image_size, dataset.image_size), quality=args.jpeg_quality,
+                            subsampling=args.jpeg_subsampling, shard_bytes=args.shard_bytes,
+                            dataset_revision=args.dataset_revision, device=args.resize_device,
+                            batch_size=args.resize_batch_size, decoder_threads=args.decoder_threads)
+            with ProcessPoolExecutor(max(1,workers), mp_context=multiprocessing.get_context('spawn')) as pool:
+                for manifests in pool.map(build, groups.values()):
+                    for manifest in manifests:
+                        print(json.dumps(manifest), flush=True)
+        else:
+            build_frame_cache(dataset, args.cache_dir, workers=args.workers)
         if args.verify:
             verify_frame_cache(dataset, args.cache_dir, samples=args.verify, seed=args.seed)
     finally:

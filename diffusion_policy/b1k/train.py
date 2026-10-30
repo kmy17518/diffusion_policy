@@ -509,7 +509,9 @@ def evaluate_validation(policy, val_dataset, config, args, device, autocast, att
             state = batch['obs']['state'][:, To - 1, :proprio].float().cpu().numpy().astype(np.float64)
             pred_np, target_np = prediction.cpu().numpy().astype(np.float64), target.float().cpu().numpy().astype(np.float64)
             if config.action_representation == 'relative':
-                pred_np, target_np = absolute_actions(pred_np, state), absolute_actions(target_np, state)
+                from diffusion_policy.b1k.robot import action_delta
+                delta = action_delta(config.gripper_action)
+                pred_np, target_np = absolute_actions(pred_np, state, delta), absolute_actions(target_np, state, delta)
             error = np.abs(pred_np - target_np) * valid.cpu().numpy()[..., None]
             per_sample = error.sum((1, 2))
             counts = valid.cpu().numpy().sum(1) * target.shape[-1]
@@ -644,6 +646,11 @@ def parser():
     result.add_argument('--num-inference-steps', type=int, default=100)
     result.add_argument('--scheduler', choices=['ddpm', 'ddim'], default='ddpm')
     result.add_argument('--no-clip-sample', action='store_true')
+    result.add_argument('--frame-selection', choices=('pi', 'legacy'), default='pi', action=ExplicitChoice)
+    result.add_argument('--gripper-action', choices=('absolute', 'delta'), default='absolute', action=ExplicitChoice)
+    result.add_argument('--stats-estimator', choices=('auto', 'exact', 'sampled', 'legacy'), default='exact', action=ExplicitChoice)
+    result.add_argument('--stats-sample-size', type=int, default=10_000_000, action=ExplicitChoice)
+    result.add_argument('--stats-file', help='Portable precomputed JSON statistics (validated against selection and recipe)')
     result.add_argument('--learning-rate', type=float, default=1e-4)
     result.add_argument('--weight-decay', type=float, default=1e-6)
     result.add_argument('--optimizer', choices=['adamw', 'upstream'], default='adamw')
@@ -900,7 +907,8 @@ def run_training(args, device, output):
         if getattr(args, 'settle_steps_explicit', False) and args.settle_steps != saved_settle:
             raise ValueError(f'--settle-steps {args.settle_steps} conflicts with the resumed checkpoint ({saved_settle})')
         args.settle_steps = saved_settle
-        for key in ('resize_mode', 'action_representation', 'normalization', 'image_augment', 'goal_stem_init'):
+        for key in ('resize_mode', 'action_representation', 'normalization', 'image_augment', 'goal_stem_init', 'frame_selection',
+                'gripper_action', 'stats_estimator', 'stats_sample_size'):
             if getattr(args, f'{key}_explicit', False) and getattr(args, key) != getattr(config, key):
                 raise ValueError(f'--{key.replace("_", "-")} {getattr(args, key)} conflicts with the resumed checkpoint '
                                  f'({getattr(config, key)})')
@@ -924,7 +932,7 @@ def run_training(args, device, output):
         for key in ('cameras', 'down_dims', 'crop_shape', 'resize_shape', 'goal_views'):
             if values[key] is not None:
                 values[key] = tuple(values[key])
-        config = ModelConfig(**values, clip_sample=not args.no_clip_sample)
+        config = ModelConfig(**values, clip_sample=not (args.no_clip_sample or args.normalization == 'quantile'))
         # the per-task held-out episodes (ACT's split: the same episodes for every policy at this seed)
         val_split = resolve_val_split(args.dataset_path, args.task_names, split, args.val_fraction, args.seed)
     args.episode_split = split
@@ -943,7 +951,8 @@ def run_training(args, device, output):
     args.language_conditioning = config.language_conditioning
     args.prompt_source = config.prompt_source
     for key in ('regime', 'goal_fusion', 'goal_source', 'goal_encoder', 'resize_mode', 'action_representation',
-                'normalization', 'image_augment', 'goal_stem_init'):
+                'normalization', 'image_augment', 'goal_stem_init', 'frame_selection',
+                'gripper_action', 'stats_estimator', 'stats_sample_size'):
         if checkpoint and getattr(args, f'{key}_explicit', False) and getattr(args, key) != getattr(config, key):
             raise ValueError(f'--{key.replace("_", "-")} conflicts with the resumed checkpoint')
         setattr(args, key, getattr(config, key))
@@ -971,7 +980,7 @@ def run_training(args, device, output):
                                     episodes=train_episodes, **dataset_kwargs)
         if checkpoint and (dataset.task_map != checkpoint['task_map'] or
                            [row['episode_index'] for row in dataset.episodes] != checkpoint['selection']['episode_indices'] or
-                           dataset.fingerprint() != checkpoint['dataset_fingerprint']):
+                           checkpoint['dataset_fingerprint'] not in (dataset.fingerprint(), dataset.legacy_fingerprint())):
             raise ValueError('Resume dataset selection, metadata or file fingerprint does not match checkpoint')
         dataset.prepare_language(checkpoint.get('language') if checkpoint else None)
         if val_split and args.val_every > 0:
@@ -994,7 +1003,9 @@ def run_training(args, device, output):
             if is_main:
                 print(f'Computing {config.normalization} normalization statistics of {config.action_representation} '
                       'actions, streaming parquet once per file (no video).', flush=True)
-                policy.set_normalizer(dataset.get_normalizer(config.normalization))
+                from diffusion_policy.b1k.stats_v2 import load_or_compute
+                stats = load_or_compute(dataset, config.normalization, args.stats_file, output)
+                policy.set_normalizer(dataset.get_normalizer(config.normalization, stats=stats))
             if distributed:  # rank 0's statistics for every rank (the same bytes, computed once)
                 import torch.distributed as dist
                 payload = [policy.normalizer.state_dict() if is_main else None]
@@ -1083,9 +1094,14 @@ def run_training(args, device, output):
         # delivers its share in micro-batches (one worker task each unless --loader-batch-size subdivides them further).
         rank_batch = args.batch_size // world_size
         micro_batch = rank_batch // args.grad_accumulation
+        from diffusion_policy.b1k.b1k_data_core import PiFrameBatchSampler
+        sampler = (PiFrameBatchSampler(len(dataset), args.batch_size, step, args.max_steps, args.seed,
+                                      loader_batch_size=args.loader_batch_size or micro_batch,
+                                      rank=rank, world_size=world_size) if config.frame_selection == 'pi' else
+                   StepBatchSampler(len(dataset), args.batch_size, step, args.max_steps, args.seed,
+                                    args.loader_batch_size or micro_batch, rank, world_size))
         loader = DataLoader(
-            dataset, batch_sampler=StepBatchSampler(len(dataset), args.batch_size, step, args.max_steps,
-                                                    args.seed, args.loader_batch_size or micro_batch, rank, world_size),
+            dataset, batch_sampler=sampler,
             num_workers=args.num_workers, pin_memory=device.type == 'cuda',
             worker_init_fn=partial(seed_worker, cpu_threads=args.worker_cpu_threads),
             generator=torch.Generator().manual_seed(args.seed + rank),

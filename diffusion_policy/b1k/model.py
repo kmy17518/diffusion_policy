@@ -93,6 +93,11 @@ class ModelConfig:
     # goal_stem_init: the goal half of the paired stem in early fusion: zero (BridgeData-style, the original), random
     # (nn.Conv2d initialization) or copy:SCALE (the camera stem's weights times SCALE, ACT's --goal-stem-init copy:0.5).
     goal_stem_init: str = 'zero'
+    # Missing fields preserve legacy checkpoints; new CLI recipes opt into v2.
+    frame_selection: str = 'legacy'
+    gripper_action: str = 'delta'
+    stats_estimator: str = 'legacy'
+    stats_sample_size: int = 10_000_000
 
     @property
     def lowdim(self):
@@ -111,7 +116,9 @@ class ModelConfig:
                 'language_conditioning': self.language_conditioning, 'prompt_source': self.prompt_source,
                 'task_onehot': self.task_onehot, 'goal_views': self.goal_views if self.goal_fusion != 'none' else (),
                 'goal_source': self.goal_source, 'gripper_state': self.gripper_state, 'resize_mode': self.resize_mode,
-                'action_representation': self.action_representation}
+                'action_representation': self.action_representation, 'frame_selection': self.frame_selection,
+                'gripper_action': self.gripper_action, 'stats_estimator': self.stats_estimator,
+                'stats_sample_size': self.stats_sample_size}
 
     def to_dict(self):
         return asdict(self)
@@ -129,6 +136,10 @@ class ModelConfig:
         return tuple(goal_key(view) for view in self.goal_views) if self.goal_fusion != 'none' else ()
 
     def validate(self):
+        if self.frame_selection not in ('pi', 'legacy') or self.gripper_action not in ('absolute', 'delta'):
+            raise ValueError('invalid frame selection or gripper action')
+        if self.stats_estimator not in ('auto', 'exact', 'sampled', 'legacy') or self.stats_sample_size < 1:
+            raise ValueError('invalid statistics estimator/sample size')
         if self.variant not in POLICY_TARGETS:
             raise ValueError(f'Unknown diffusion variant {self.variant!r}')
         if self.gripper_state not in GRIPPER_STATES:

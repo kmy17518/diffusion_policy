@@ -307,7 +307,8 @@ class B1KLeRobotDataset(BaseImageDataset):
                  obs_steps=None, imagenet_norm=False, language_conditioning='none',
                  prompt_source='task_name', task_onehot=True, image_dtype='float32', frame_cache=None,
                  video_max_open=32, goal_views=(), goal_source='episode_last', episodes=None, settle_steps='all',
-                 gripper_state='sum', resize_mode='dp', action_representation='absolute', return_meta=False):
+                 gripper_state='sum', resize_mode='dp', action_representation='absolute', return_meta=False, frame_selection='legacy',
+                 gripper_action='delta', stats_estimator='legacy', stats_sample_size=10_000_000):
         """
         goal_views / goal_source (goal-image conditioning): for every camera in `goal_views` (a subset of `cameras`)
         each sample also carries `goal_<camera>`, one (3, S, S) image for the whole episode with no observation-
@@ -347,6 +348,12 @@ class B1KLeRobotDataset(BaseImageDataset):
             raise ValueError('Relative actions need gripper_state sum (one state value per action dimension)')
         self.gripper_state = gripper_state
         self.resize_mode = resize_mode
+        from diffusion_policy.b1k.robot import action_delta
+        if frame_selection not in ('pi', 'legacy'):
+            raise ValueError('frame_selection must be pi or legacy')
+        self.frame_selection, self.gripper_action = frame_selection, gripper_action
+        self.action_delta = action_delta(gripper_action)
+        self.stats_estimator, self.stats_sample_size = stats_estimator, stats_sample_size
         self.action_representation = action_representation
         self.return_meta = bool(return_meta)
         self.root = Path(dataset_path).resolve()
@@ -494,7 +501,7 @@ class B1KLeRobotDataset(BaseImageDataset):
         self.sampler = EpisodeSequenceIndex(
             [row['length'] for row in self.episodes], horizon,
             n_obs_steps - 1 if pad_before is None else pad_before,
-            n_action_steps - 1 if pad_after is None else pad_after)
+            (horizon - n_obs_steps if frame_selection == 'pi' else n_action_steps - 1) if pad_after is None else pad_after)
         if not len(self.sampler):
             raise ValueError('No sequences for this horizon and padding')
         self.frame_cache_formats = set()
@@ -503,7 +510,10 @@ class B1KLeRobotDataset(BaseImageDataset):
             self.frame_cache_formats = FrameCacheReader(
                 self.frame_cache, self.root, self.image_size, resize_mode=self.resize_mode).validate(
                 {self.video_path(row, camera) for row in self.episodes for camera in self.cameras})
+        self._sidecar = None
         self._reset_cache()
+        if self.frame_cache is not None:
+            self._ensure_sidecar()
         if self.goal_views:
             self._build_goal_table()
 
@@ -520,6 +530,10 @@ class B1KLeRobotDataset(BaseImageDataset):
         frames go through the same `resize_rgb` as the cameras (from the frame cache when one is attached and the
         goal is a camera frame), so the goal path matches the observation path exactly.
         """
+        if self.frame_cache is not None and self.goal_source == 'episode_last':
+            from diffusion_policy.b1k.sidecar import CachedGoals
+            self.goal_table = CachedGoals(self)
+            return
         started = time.perf_counter()
         table = np.empty((len(self.episodes), len(self.goal_views), self.image_size, self.image_size, 3), dtype=np.uint8)
         reader = (VideoReader(self.image_size, max_open=self.video_max_open, resize_mode=self.resize_mode)
@@ -562,12 +576,22 @@ class B1KLeRobotDataset(BaseImageDataset):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        for key in ('_episodes', '_row_groups', '_video'):
+        for key in ('_episodes', '_row_groups', '_video', '_sidecar'):
             state.pop(key, None)
+        if self.frame_cache is not None:
+            from diffusion_policy.b1k.b1k_selection import compact_worker_state
+            # This dataset selection is immutable during a loader's lifetime. Compute
+            # its spawn identity once, not once per worker (108k episodes at scale).
+            if not hasattr(self, '_spawn_fingerprint'):
+                self._spawn_fingerprint = self.fingerprint()
+            directory = Path(str(self.frame_cache) + '-dp-tables') / self._spawn_fingerprint
+            state['_worker_fingerprint'] = self._spawn_fingerprint
+            state = compact_worker_state(state, directory, lookup_keys=('recorded_lengths',), sampler_key='sampler')
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        self._sidecar = None
         self._reset_cache()
 
     def close(self):
@@ -586,7 +610,21 @@ class B1KLeRobotDataset(BaseImageDataset):
             video_key=key, chunk_index=episode[f'videos/{key}/chunk_index'],
             file_index=episode[f'videos/{key}/file_index'])
 
+    def _ensure_sidecar(self):
+        if self._sidecar is None:
+            from diffusion_policy.b1k.sidecar import open_sidecar
+            self._sidecar = open_sidecar(self)
+        return self._sidecar
+
     def _read_episode(self, episode):
+        if self.frame_cache is not None:
+            maps = self._ensure_sidecar()
+            position = maps['positions'][episode['episode_index']]
+            lo, hi = maps['starts'][position:position+2]
+            return {k:maps[k][lo:hi] for k in ('state','action','timestamp')}
+        return self._read_episode_parquet(episode)
+
+    def _read_episode_parquet(self, episode):
         if self._pid != os.getpid():
             self.close()
             self._reset_cache()
@@ -658,7 +696,7 @@ class B1KLeRobotDataset(BaseImageDataset):
         current = int(frames[self.n_obs_steps - 1])  # the current frame: the last observation step
         actions = data['action'][frames]
         if self.action_representation == 'relative':
-            actions = relative_actions(actions, data['state'][current])
+            actions = relative_actions(actions, data['state'][current], self.action_delta)
         state = condition_state(data['state'][obs_frames],
                                 np.full(len(obs_frames), episode['task_index']), self.task_map, self.task_onehot)
         obs = {'state': torch.from_numpy(state)}
@@ -717,6 +755,15 @@ class B1KLeRobotDataset(BaseImageDataset):
                     }
 
     def fingerprint(self):
+        if getattr(self, '_worker_fingerprint', None) is not None:
+            return self._worker_fingerprint
+        from diffusion_policy.b1k.b1k_data_core import fingerprint
+        # RGB/goal camera metadata does not change the low-dimensional selection.
+        episodes = [{k:v for k,v in ep.items() if not k.startswith('videos/')} for ep in self.episodes]
+        return fingerprint(self.root, episodes, [self.data_path(e) for e in self.episodes],
+                           tasks=self.task_map, gripper_state=self.gripper_state)
+
+    def legacy_fingerprint(self):
         paths = {self.data_path(row) for row in self.episodes}
         paths.update(self.video_path(row, camera) for row in self.episodes for camera in self.cameras)
         files = [(str(path.relative_to(self.root)), path.stat().st_size, path.stat().st_mtime_ns)
@@ -758,6 +805,9 @@ class B1KLeRobotDataset(BaseImageDataset):
         ZSCORE_STD_FLOOR) or `quantile` (exact linear q01 / q99, dims narrower than QUANTILE_MIN_RANGE widened around
         their center as ACT does); min / max / mean / std always. Streams each packed file once; the chunk values of all
         23 action dimensions are held in memory (float32, 23 x valid steps)."""
+        if self.stats_estimator != 'legacy':
+            from diffusion_policy.b1k.stats_v2 import compute_stats
+            return compute_stats(self, normalization)
         if normalization not in ('zscore', 'quantile'):
             raise ValueError(f'compute_action_stats serves zscore or quantile, not {normalization!r}')
         relative = self.action_representation == 'relative'
@@ -827,7 +877,10 @@ class B1KLeRobotDataset(BaseImageDataset):
                                  'computed over chunk steps relative to the current state)')
             normalizer = fit_normalizer(self.iter_lowdim(), self.cameras, proprio_dim(self.gripper_state))
         else:
-            normalizer = normalizer_from_stats(self.compute_action_stats(normalization), self.cameras,
+            stats = kwargs.pop('stats', None)
+            if stats is None:
+                stats = self.compute_action_stats(normalization)
+            normalizer = normalizer_from_stats(stats, self.cameras,
                                                proprio_dim(self.gripper_state), self.task_onehot)
         if self.observation_mode == 'lowdim':
             result = LinearNormalizer()

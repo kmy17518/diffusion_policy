@@ -52,8 +52,11 @@ unpackb = functools.partial(msgpack.unpackb, object_hook=unpack_array, strict_ma
 
 class B1KPolicySession:
     def __init__(self, policy, config, task_map, action_horizon=None, task_name=None, language=None, fixed_goals=None,
-                 gripper_snap=DEFAULT_GRIPPER_SNAP):
+                 gripper_snap=DEFAULT_GRIPPER_SNAP, jpeg_quality=None, jpeg_subsampling=0):
         self.policy = policy
+        self.jpeg_quality, self.jpeg_subsampling = jpeg_quality, jpeg_subsampling
+        if jpeg_quality is not None and (not 1 <= jpeg_quality <= 100 or jpeg_subsampling not in (0,1,2)):
+            raise ValueError('invalid JPEG quality/subsampling')
         self.model_config = ModelConfig(**config)
         self.config = self.model_config.to_dict()
         self.task_map = task_map
@@ -125,6 +128,9 @@ class B1KPolicySession:
             # frames already at the training size (the evaluator resizes and quantizes on its side with ACT's path)
             # pass through unchanged in resize mode act; others are resized here with the training-time resize
             images = np.stack([resize_rgb(image, self.config['image_size'], resize_mode) for image in images])
+            if self.jpeg_quality is not None:
+                from diffusion_policy.b1k.b1k_cache_v2 import jpeg_roundtrip
+                images = np.stack([jpeg_roundtrip(x,self.jpeg_quality,self.jpeg_subsampling) for x in images])
             current[camera] = np.moveaxis(images, -1, 1).astype(np.float32) / 255.
         goals = {}
         for view in self.goal_views:
@@ -140,6 +146,9 @@ class B1KPolicySession:
             else:
                 raise ValueError(f'Goal-conditioned checkpoint needs {key} in the observation (or --goal-image {view}=PATH)')
             images = np.stack([resize_rgb(image, self.config['image_size'], resize_mode) for image in images])
+            if self.jpeg_quality is not None:
+                from diffusion_policy.b1k.b1k_cache_v2 import jpeg_roundtrip
+                images = np.stack([jpeg_roundtrip(x,self.jpeg_quality,self.jpeg_subsampling) for x in images])
             goals[goal_key(view)] = np.moveaxis(images, -1, 1).astype(np.float32) / 255.
         if len(self.histories) != batch_size:
             self.reset()
@@ -176,7 +185,8 @@ class B1KPolicySession:
                 raise ValueError('Policy returned non-finite action')
             if self.relative:  # absolute commands with the state the plan was predicted from (the current frame's)
                 reference = np.stack([self.histories[slot][-1]['__proprio__'] for slot in needs_plan])
-                predicted = absolute_actions(predicted.astype(np.float64), reference).astype(np.float32)
+                predicted = absolute_actions(predicted.astype(np.float64), reference,
+                                           __import__('diffusion_policy.b1k.robot', fromlist=['action_delta']).action_delta(self.model_config.gripper_action)).astype(np.float32)
             for slot, plan in zip(needs_plan, predicted):
                 self.actions[slot].extend(plan[:self.action_horizon].astype(np.float32))
         return snap_grippers(np.stack([queue.popleft() for queue in self.actions]).astype(np.float32), self.gripper_snap)
@@ -203,18 +213,20 @@ def load_goal_images(specs):
 
 class WebsocketPolicyServer:
     def __init__(self, policy, checkpoint, host='0.0.0.0', port=8000,
-                 action_horizon=None, task_name=None, fixed_goals=None, gripper_snap=DEFAULT_GRIPPER_SNAP):
+                 action_horizon=None, task_name=None, fixed_goals=None, gripper_snap=DEFAULT_GRIPPER_SNAP,
+                 jpeg_quality=None, jpeg_subsampling=0):
         self.policy, self.checkpoint = policy, checkpoint
         self.host, self.port = host, port
         self.action_horizon, self.task_name = action_horizon, task_name
         self.fixed_goals = fixed_goals or {}
         self.gripper_snap = gripper_snap
+        self.jpeg_quality, self.jpeg_subsampling = jpeg_quality, jpeg_subsampling
         self.new_session()
 
     def new_session(self):
         return B1KPolicySession(self.policy, self.checkpoint['config'], self.checkpoint['task_map'],
                                 self.action_horizon, self.task_name, self.checkpoint.get('language'), self.fixed_goals,
-                                self.gripper_snap)
+                                self.gripper_snap, self.jpeg_quality, self.jpeg_subsampling)
 
     def metadata(self, session):
         """The handshake. BEHAVIOR's NumPy-MessagePack protocol as ACT's b1k_server.py speaks it (`protocol`,
@@ -285,6 +297,8 @@ def main(argv=None):
     parser.add_argument('--action-horizon', type=int)
     parser.add_argument('--task-name')
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--jpeg-quality', type=int, help='Opt-in v2 serving parity after resize; match cache quality')
+    parser.add_argument('--jpeg-subsampling', type=int, choices=(0,1,2), default=0)
     parser.add_argument('--cpu-threads', type=int, default=4)
     parser.add_argument('--goal-image', action='append', metavar='CAMERA=PATH',
                         help='Goal-conditioned checkpoints: fixed goal image (PNG/JPEG, RGB) for a camera view, used '
@@ -299,7 +313,7 @@ def main(argv=None):
     policy, checkpoint = load_policy(args.model_path, args.device)
     server = WebsocketPolicyServer(policy, checkpoint, args.host, args.port,
                                    args.action_horizon, args.task_name, load_goal_images(args.goal_image),
-                                   args.gripper_snap_threshold)
+                                   args.gripper_snap_threshold, args.jpeg_quality, args.jpeg_subsampling)
     asyncio.run(server.run())
 
 

@@ -40,7 +40,7 @@ class RunningStats:
         }.items()}
 
 
-def field_from_stats(stats, method, eps=1e-6):
+def field_from_stats(stats, method, eps=1e-6, std_eps=0.0):
     """A SingleFieldLinearNormalizer (`x * scale + offset`) for one group's statistics dict (`min`, `max`, `mean`,
     `std` and, for quantile, `q01` / `q99`; one value per dimension):
 
@@ -53,7 +53,7 @@ def field_from_stats(stats, method, eps=1e-6):
     def array(key):
         return np.asarray(stats[key], dtype=np.float64)
     if method == 'zscore':
-        scale = 1.0 / array('std')
+        scale = 1.0 / (array('std') + std_eps)
         offset = -array('mean') * scale
         keys = ('min', 'max', 'mean', 'std')
     elif method == 'quantile':
@@ -72,12 +72,12 @@ def normalizer_from_stats(stats, cameras, proprio_size, task_onehot=True):
     cameras get the image range normalizer."""
     normalizer = LinearNormalizer()
     method = stats['method']
-    state = field_from_stats(stats['state'], method, stats.get('quantile_eps', 1e-6))
+    state = field_from_stats(stats['state'], method, stats.get('quantile_eps', 1e-6), stats.get('std_eps', 0.0))
     if task_onehot and len(stats['state']['mean']) > proprio_size:
         state.params_dict['scale'].data[proprio_size:] = 1
         state.params_dict['offset'].data[proprio_size:] = 0
     normalizer['state'] = state
-    normalizer['action'] = field_from_stats(stats['action'], method, stats.get('quantile_eps', 1e-6))
+    normalizer['action'] = field_from_stats(stats['action'], method, stats.get('quantile_eps', 1e-6), stats.get('std_eps', 0.0))
     for camera in cameras:
         normalizer[camera] = get_image_range_normalizer()
     normalizer.requires_grad_(False)
