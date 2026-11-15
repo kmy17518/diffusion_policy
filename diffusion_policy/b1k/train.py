@@ -377,7 +377,8 @@ def save_checkpoint(output, policy, ema, optimizer, lr_scheduler, config, datase
                      'optimizer': args.optimizer, 'betas': tuple(args.betas),
                      'obs_encoder_weight_decay': args.obs_encoder_weight_decay,
                      'lr_scheduler': args.lr_scheduler, 'lr_warmup_steps': args.lr_warmup_steps,
-                     'lr_schedule_steps': args.lr_schedule_steps, 'ema_power': args.ema_power,
+                     'lr_schedule_steps': args.lr_schedule_steps, 'lr_decay_ratio': args.lr_decay_ratio,
+                     'ema_power': args.ema_power,
                      'grad_clip': args.grad_clip, 'grad_accumulation': args.grad_accumulation},
         'lr_scheduler': lr_scheduler.state_dict(),
         'selection': selection_record(dataset, args),
@@ -651,16 +652,30 @@ def parser():
     result.add_argument('--stats-estimator', choices=('auto', 'exact', 'sampled', 'legacy'), default='exact', action=ExplicitChoice)
     result.add_argument('--stats-sample-size', type=int, default=10_000_000, action=ExplicitChoice)
     result.add_argument('--stats-file', help='Portable precomputed JSON statistics (validated against selection and recipe)')
+    result.add_argument('--prepare-only', action='store_true',
+                        help='Precompute everything this exact run reads, then exit without training (CPU, one process): '
+                             'the normalization statistics (written to --stats-file) and, with --frame-cache, the '
+                             'training and validation selections\' sidecar tables and loader-worker sidecars. Same flags '
+                             'as the training run; no W&B')
+    result.add_argument('--require-prepared', action='store_true',
+                        help='Refuse to compute anything at startup that --prepare-only precomputes: needs --stats-file '
+                             'and, with --frame-cache, both selections\' sidecar tables')
     result.add_argument('--learning-rate', type=float, default=1e-4)
     result.add_argument('--weight-decay', type=float, default=1e-6)
     result.add_argument('--optimizer', choices=['adamw', 'upstream'], default='adamw')
     result.add_argument('--obs-encoder-weight-decay', type=float, default=1e-6)
     result.add_argument('--betas', type=float, nargs=2, default=[0.9, 0.999])
-    result.add_argument('--lr-scheduler', choices=['constant', 'cosine'], default='constant',
+    result.add_argument('--lr-scheduler', choices=['constant', 'cosine', 'pi_cosine'], default='constant',
                         help="upstream Diffusion Policy schedule: 'cosine' = linear warmup then cosine decay to 0 "
-                             'over --lr-schedule-steps optimizer steps (stepped after every optimizer step)')
+                             "over --lr-schedule-steps optimizer steps (stepped after every optimizer step); "
+                             "'pi_cosine' = openpi pi05's CosineDecaySchedule: linear warmup from LR / (warmup + 1) "
+                             'over --lr-warmup-steps, cosine decay to --lr-decay-ratio x LR at --lr-schedule-steps '
+                             '(warmup included), constant afterwards')
     result.add_argument('--lr-warmup-steps', type=int, default=0)
-    result.add_argument('--lr-schedule-steps', type=int,
+    result.add_argument('--lr-decay-ratio', type=float, default=0.1,
+                        help="pi_cosine floor as a fraction of --learning-rate (pi05: 2.5e-6 / 2.5e-5 = 0.1)")
+    result.add_argument('--lr-schedule-steps', '--lr-decay-steps', '--lr_schedule.decay_steps', dest='lr_schedule_steps',
+                        type=int,
                         help='Length of the cosine schedule in optimizer steps (default: --max-steps). Fixed at '
                              'the first launch and restored on resume, so a later --max-steps change does not '
                              'reshape the schedule')
@@ -841,8 +856,10 @@ def main(argv=None):
             (args.lr_schedule_steps is not None and args.lr_schedule_steps < 1)):
         raise ValueError('--lr-warmup-steps and --grad-clip must be nonnegative, --ema-power positive, '
                          '--lr-schedule-steps positive')
-    if args.lr_scheduler == 'cosine' and args.lr_warmup_steps >= (args.lr_schedule_steps or args.max_steps):
+    if args.lr_scheduler in ('cosine', 'pi_cosine') and args.lr_warmup_steps >= (args.lr_schedule_steps or args.max_steps):
         raise ValueError('--lr-warmup-steps must be smaller than the cosine schedule length')
+    if not 0.0 <= args.lr_decay_ratio <= 1.0:
+        raise ValueError('--lr-decay-ratio must be in [0, 1]')
     if args.learning_rate <= 0 or min(args.weight_decay, args.obs_encoder_weight_decay) < 0:
         raise ValueError('Learning rate must be positive and weight decay nonnegative')
     if not all(0 <= beta < 1 for beta in args.betas):
@@ -859,7 +876,8 @@ def main(argv=None):
     try:
         if rank == 0:
             with output_lock(output):
-                if any(path.name != 'run.lock' for path in output.iterdir()) and args.resume is None:
+                if (any(path.name != 'run.lock' for path in output.iterdir()) and args.resume is None
+                        and not args.prepare_only):
                     raise FileExistsError(f'Output directory is nonempty: {output}; use --resume or a new directory')
                 run_training(args, device, output)
         else:
@@ -920,6 +938,7 @@ def run_training(args, device, output):
                            # Checkpoints predating these options trained with a constant learning rate,
                            # EMA power 2/3 and gradient clipping at 1.0.
                            'lr_scheduler': 'constant', 'lr_warmup_steps': 0, 'lr_schedule_steps': None,
+                           'lr_decay_ratio': 0.1,
                            'ema_power': 2 / 3, 'grad_clip': 1.0, 'grad_accumulation': 1,
                            **checkpoint['training']}.items():
             setattr(args, key, value)
@@ -965,7 +984,9 @@ def run_training(args, device, output):
         raise ValueError(f'--max-steps is a total target and must exceed checkpoint step {checkpoint["step"]}')
     distributed = world_size > 1
     is_main = rank == 0
-    wandb_run = initialize_wandb(args, output, checkpoint, config) if is_main else None
+    if args.require_prepared and not checkpoint and not (args.stats_file and Path(args.stats_file).is_file()):
+        raise FileNotFoundError('--require-prepared needs the precomputed --stats-file (run --prepare-only first)')
+    wandb_run = initialize_wandb(args, output, checkpoint, config) if is_main and not args.prepare_only else None
     dataset = val_dataset = None
     exit_code = 1
     try:
@@ -975,7 +996,8 @@ def run_training(args, device, output):
         train_episodes = val_split['train_episodes'] if val_split else (split['episodes'] if split else None)
         dataset_kwargs = dict(config.dataset_kwargs(), episode_cache_size=args.episode_cache_size,
                               parquet_cache_mb=args.parquet_cache_mb, image_dtype='uint8', frame_cache=args.frame_cache,
-                              video_max_open=args.video_max_open, settle_steps=args.settle_steps)
+                              video_max_open=args.video_max_open, settle_steps=args.settle_steps,
+                              require_prepared=args.require_prepared)
         dataset = B1KLeRobotDataset(args.dataset_path, args.task_names, max_episodes=args.max_episodes,
                                     episodes=train_episodes, **dataset_kwargs)
         if checkpoint and (dataset.task_map != checkpoint['task_map'] or
@@ -990,6 +1012,21 @@ def run_training(args, device, output):
                 raise ValueError('The validation episodes do not cover the training tasks')
             if config.language_conditioning == 'clip_film':
                 val_dataset.prepare_language(dataset.language)
+        if args.prepare_only:
+            from diffusion_policy.b1k.stats_v2 import load_or_compute
+            if args.stats_file:
+                Path(args.stats_file).parent.mkdir(parents=True, exist_ok=True)
+            started = time.monotonic()
+            load_or_compute(dataset, config.normalization, args.stats_file, output, create=True)
+            for name, part in (('train', dataset), ('val', val_dataset)):
+                if part is not None:
+                    part.prepare_tables()
+            print(json.dumps({'prepared': {'stats_file': args.stats_file, 'episodes': len(dataset.episodes),
+                                           'sequences': len(dataset),
+                                           'val_episodes': len(val_dataset.episodes) if val_dataset else 0,
+                                           'seconds': round(time.monotonic() - started, 1)}}), flush=True)
+            exit_code = 0
+            return None
         if is_main:
             print(json.dumps({'episodes': len(dataset.episodes), 'sequences': len(dataset),
                               'val_episodes': len(val_dataset.episodes) if val_dataset else 0,
@@ -1045,8 +1082,17 @@ def run_training(args, device, output):
             args.lr_schedule_steps = args.max_steps
         # Upstream Diffusion Policy's schedule (diffusers' get_scheduler copy): constant, or linear warmup then
         # cosine decay to zero over lr_schedule_steps; stepped once per optimizer step.
-        lr_scheduler = get_scheduler(args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps,
-                                     num_training_steps=args.lr_schedule_steps)
+        if args.lr_scheduler == 'pi_cosine':
+            # openpi's pi05 schedule (b1k_data_core.pi_lr_factor, checked against optax), as a LambdaLR multiple of
+            # every group's LR; its index is the number of optimizer steps taken, as optax's count.
+            import functools
+            from diffusion_policy.b1k.b1k_data_core import pi_lr_factor
+            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, functools.partial(pi_lr_factor, warmup_steps=args.lr_warmup_steps,
+                                   decay_steps=args.lr_schedule_steps, end_ratio=args.lr_decay_ratio))
+        else:
+            lr_scheduler = get_scheduler(args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps,
+                                         num_training_steps=args.lr_schedule_steps)
         step = 0
         if checkpoint:
             ema.averaged_model.load_state_dict(checkpoint['ema_model'])

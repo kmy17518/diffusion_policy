@@ -27,6 +27,9 @@ def open_sidecar(dataset):
     with (directory/'lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         complete = directory/'complete.json'
+        if not complete.is_file() and getattr(d, 'require_prepared', False):
+            raise FileNotFoundError(f'--require-prepared: the frame-cache tables {directory} are missing '
+                                    '(run --prepare-only with the same flags first)')
         if not complete.is_file():
             maps = {name:np.lib.format.open_memmap(directory/(name+'.npy'), mode='w+', dtype=dtypes[name], shape=shape)
                     for name,shape in shapes.items()}

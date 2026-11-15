@@ -44,7 +44,7 @@ def compute_stats(dataset, method):
     return result
 
 
-def load_or_compute(dataset, method, stats_file, output):
+def load_or_compute(dataset, method, stats_file, output, create=False):
     if method == 'limits':
         if stats_file:
             raise ValueError('--stats-file is for zscore/quantile')
@@ -63,8 +63,8 @@ def load_or_compute(dataset, method, stats_file, output):
         if len(stats['state']['mean']) != expected_dim:
             raise ValueError(f'statistics state/task-onehot dimension mismatch: {path}')
         return stats
-    if stats_file:
-        raise FileNotFoundError(path)
+    if stats_file and not create:
+        raise FileNotFoundError(f'{path} (precompute it with --prepare-only)')
     stats = dataset.compute_action_stats(method)
     if dataset.stats_estimator != 'legacy':
         from .b1k_cache_v2 import atomic_json

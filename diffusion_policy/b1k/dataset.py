@@ -308,7 +308,8 @@ class B1KLeRobotDataset(BaseImageDataset):
                  prompt_source='task_name', task_onehot=True, image_dtype='float32', frame_cache=None,
                  video_max_open=32, goal_views=(), goal_source='episode_last', episodes=None, settle_steps='all',
                  gripper_state='sum', resize_mode='dp', action_representation='absolute', return_meta=False, frame_selection='legacy',
-                 gripper_action='delta', stats_estimator='legacy', stats_sample_size=10_000_000):
+                 gripper_action='delta', stats_estimator='legacy', stats_sample_size=10_000_000,
+                 require_prepared=False):
         """
         goal_views / goal_source (goal-image conditioning): for every camera in `goal_views` (a subset of `cameras`)
         each sample also carries `goal_<camera>`, one (3, S, S) image for the whole episode with no observation-
@@ -338,6 +339,8 @@ class B1KLeRobotDataset(BaseImageDataset):
         return_meta: samples also carry `action_valid` (horizon,) -- False at edge-padded steps -- and `meta`
         {'task': task_index, 'episode': position in self.episodes, 'frame': current frame} for validation.
         """
+        # --require-prepared: the frame-cache sidecar must already exist (built by --prepare-only), never built here
+        self.require_prepared = bool(require_prepared)
         if gripper_state not in GRIPPER_STATES:
             raise ValueError(f'Unknown gripper_state {gripper_state!r}; expected one of {GRIPPER_STATES}')
         if resize_mode not in RESIZE_MODES:
@@ -609,6 +612,19 @@ class B1KLeRobotDataset(BaseImageDataset):
         return self.root / self.info['video_path'].format(
             video_key=key, chunk_index=episode[f'videos/{key}/chunk_index'],
             file_index=episode[f'videos/{key}/file_index'])
+
+    def sidecar_prepared(self):
+        """Whether this selection's frame-cache tables exist (always True without a frame cache)."""
+        if self.frame_cache is None:
+            return True
+        return (Path(str(self.frame_cache) + '-dp-tables') / self.fingerprint() / 'complete.json').is_file()
+
+    def prepare_tables(self):
+        """Build what a training run's loader reads besides the frames: the selection's sidecar tables (built at
+        construction) and the compact loader-worker sidecar."""
+        if self.frame_cache is not None:
+            self._ensure_sidecar()
+            self.__getstate__()  # writes the worker-selection sidecar once
 
     def _ensure_sidecar(self):
         if self._sidecar is None:
