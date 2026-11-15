@@ -18,11 +18,12 @@
 # Environment (defaults in brackets):
 #   DATASET        LeRobot v3 root (required)              FRAME_CACHE [$DATASET-act-frame-cache-224x224]
 #   GOAL_FUSION    early | late [early]                    RUN [dp-isg224-relq-$GOAL_FUSION-piaug-ddp4-bs1024-s$SEED]
-#   OUT_ROOT       [/tmp/dev/runs/train224]  PY [python]  GPUS [0,1,2,3]  NUM_WORKERS per rank [8]  CACHE_WORKERS [16]
+#   OUT_ROOT       [/tmp/dev/runs/train224]  PY [<checkout>/.venv/bin/python]  GPUS [0,1,2,3]  NUM_WORKERS per rank [8]  CACHE_WORKERS [16]
 #   MAX_STEPS      [200000]   SAVE [10000] (save = export = validate)   SEED [0]   VAL_FRACTION [0.05]
 #   SETTLE_STEPS   [all]: the dataset's own settle window     TASK_NAMES [every task of the dataset]
 #   WANDB_ENTITY   [kmy17518]   WANDB_PROJECT [b1k-isg-train224]   WANDB_MODE [online] (needs WANDB_API_KEY)
 #   HF_REPO        [kmy17518/$RUN]   HF_PUBLIC [0]   HF_XET [1]   (needs HF_TOKEN with write access)
+#   UPLOAD         [1]; 0 trains without the upload monitor (smoke tests)
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 : "${DATASET:?set DATASET to the LeRobot v3 root}"
@@ -33,7 +34,7 @@ RUN=${RUN:-dp-isg224-relq-$GOAL_FUSION-piaug-ddp4-bs1024-s$SEED}
 OUT_ROOT=${OUT_ROOT:-/tmp/dev/runs/train224}
 OUT=$OUT_ROOT/$RUN
 STATS=$OUT_ROOT/stats/$RUN.json
-PY=${PY:-python}
+PY=${PY:-$HERE/.venv/bin/python}  # the venv of setup_venv.sh (ACT) / the b1k.md uv lines (DP)
 GPUS=${GPUS:-0,1,2,3}
 NPROC=$(( $(tr -cd ',' <<< "$GPUS" | wc -c) + 1 ))
 MAX_STEPS=${MAX_STEPS:-200000}
@@ -91,8 +92,9 @@ train() {
     local resume=()
     [[ ! -e $OUT/latest.pt ]] || resume=(--resume "$OUT/latest.pt")
     rm -f "$OUT_ROOT/$RUN.stop"
-    upload >> "$OUT_ROOT/upload/$RUN.log" 2>&1 &
-    local uploader=$! rc=0
+    local uploader=''
+    if [[ ${UPLOAD:-1} == 1 ]]; then upload >> "$OUT_ROOT/upload/$RUN.log" 2>&1 & uploader=$!; fi
+    local rc=0
     echo "[$(date -u +%FT%TZ)] $RUN: training on GPUs $GPUS (${resume[*]:-fresh start}); uploader pid $uploader -> $HF_REPO"
     (cd "$HERE" && CUDA_VISIBLE_DEVICES=$GPUS OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
         ARROW_NUM_THREADS=1 PYTORCH_ALLOC_CONF=expandable_segments:True WANDB_CONSOLE=off \
@@ -100,7 +102,7 @@ train() {
         -m diffusion_policy.b1k.train "${recipe[@]}" "${runtime[@]}" --require-prepared "${resume[@]}") || rc=$?
     if ((rc == 0)); then
         echo "[$(date -u +%FT%TZ)] $RUN: trainer finished; waiting for the uploader to publish the last checkpoints"
-        wait "$uploader" || echo "uploader exited with $?; restart it with '$0 upload'" >&2
+        [[ -z $uploader ]] || wait "$uploader" || echo "uploader exited with $?; restart it with '$0 upload'" >&2
     else
         echo "[$(date -u +%FT%TZ)] $RUN: trainer exited with $rc; the uploader (pid $uploader) keeps publishing what is" \
              "queued; '$0 train' resumes both" >&2

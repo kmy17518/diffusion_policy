@@ -566,3 +566,13 @@ completed in 50.1 min for ACT, 18.0 min for DP and 36.9 min for Pi with the cont
 above. Every normalization array matched the corresponding raw-scratch exact run
 bit for bit; scratch footprints were 77.6, 17.2 and 28.4 GB respectively. These
 are computation measurements, not timings for loading an unseen future dataset.
+
+## isg-train224 (branch `isg-train224`)
+
+Same changes as kmy17518/act `isg-train224`; `scripts/b1k/isg_train224.sh` (`cache`, `prepare`, `train`, `upload`, `all`).
+Absolute grippers (state q1 + q2 in metres), `--no-clip-sample` (quantile-normalized targets exceed +-1; the
+quantile recipe already disabled clipping, the flag makes it explicit), `--prepare-only` / `--require-prepared`
+(statistics and the frame-cache sidecar tables before the run), Pi-style frame epochs, `--val-fraction 0.05` (ACT's
+and openpi's episodes), `--lr-scheduler pi_cosine --lr-warmup-steps 1000 --lr-schedule-steps N --lr-decay-ratio 0.1`
+(openpi pi05's schedule; `--lr-decay-steps` / `--lr_schedule.decay_steps` are aliases), 3 local full checkpoints and the
+Hugging Face upload monitor beside the trainer. The frame cache is ACT's (`--resize-mode act`); one cache serves both.
