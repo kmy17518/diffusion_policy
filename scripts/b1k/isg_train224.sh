@@ -20,6 +20,8 @@
 #   GOAL_FUSION    early | late [early]                    RUN [dp-isg224-relq-$GOAL_FUSION-piaug-ddp4-bs1024-s$SEED]
 #   OUT_ROOT       [/tmp/dev/runs/train224]  PY [<checkout>/.venv/bin/python]  GPUS [0,1,2,3]  NUM_WORKERS per rank [8]  CACHE_WORKERS [16]
 #   MAX_STEPS      [200000]   SAVE [10000] (save = export = validate)   SEED [0]   VAL_FRACTION [0.05]
+#   LR             peak learning rate [1e-4]   LR_WARMUP_STEPS [1000]   LR_DECAY_STEPS [MAX_STEPS]
+#   LR_DECAY_RATIO final / peak LR of the cosine decay [0.1]; e.g. 0.01 decays 1e-4 to 1e-6
 #   SETTLE_STEPS   [all]: the dataset's own settle window     TASK_NAMES [every task of the dataset]
 #   WANDB_ENTITY   [kmy17518]   WANDB_PROJECT [b1k-isg-train224]   WANDB_MODE [online] (needs WANDB_API_KEY)
 #   HF_REPO        [kmy17518/$RUN]   HF_PUBLIC [0]   HF_XET [1]   (needs HF_TOKEN with write access)
@@ -52,8 +54,9 @@ recipe=(--dataset-path "$DATASET" --episode-split auto --settle-steps "${SETTLE_
     --variant transformer_hybrid_image --n-layer 12 --n-emb 512 --n-head 8 --conditioning global
     --horizon 16 --n-obs-steps 2 --n-action-steps 8 --image-size 224
     --scheduler ddpm --num-train-timesteps 100 --num-inference-steps 100 --no-clip-sample
-    --learning-rate 1e-4 --weight-decay 1e-6 --optimizer adamw --betas 0.9 0.999
-    --lr-scheduler pi_cosine --lr-warmup-steps 1000 --lr-schedule-steps "$MAX_STEPS" --lr-decay-ratio 0.1
+    --learning-rate "${LR:-1e-4}" --weight-decay 1e-6 --optimizer adamw --betas 0.9 0.999
+    --lr-scheduler pi_cosine --lr-warmup-steps "${LR_WARMUP_STEPS:-1000}" --lr-schedule-steps "${LR_DECAY_STEPS:-$MAX_STEPS}"
+    --lr-decay-ratio "${LR_DECAY_RATIO:-0.1}"
     --ema-power 0.6667 --grad-clip 1.0
     --frame-cache "$FRAME_CACHE" --resize-mode act --action-representation relative --normalization quantile
     --stats-estimator exact --frame-selection pi --image-augment pi05 --val-fraction "${VAL_FRACTION:-0.05}"
