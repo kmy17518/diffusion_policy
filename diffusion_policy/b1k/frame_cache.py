@@ -142,6 +142,51 @@ def build_entry(source, stem, image_size, dataset_root, resize_mode='dp'):
     return manifest
 
 
+# How v1 entries' frames are read. `pread` (default): one os.pread per frame on a descriptor opened with
+# POSIX_FADV_RANDOM, so the kernel reads exactly the requested 150 KB. `mmap`: the earlier np.load(mmap_mode='r') path;
+# its page faults + readahead thrash the page cache once the cache is larger than RAM (measured on 4 x H200 with the
+# 5.9 TiB v2 cache and 1.7 TB RAM: 1.9 s/step, 39 % memory-pressure stall, vs 0.25 s when the frames were resident).
+FRAME_READ = os.environ.get('B1K_FRAME_READ', 'pread')
+if FRAME_READ not in ('pread', 'mmap'):
+    raise ValueError(f'B1K_FRAME_READ must be pread or mmap, got {FRAME_READ!r}')
+
+
+class _PreadFrames:
+    """Rows of a v1 frames .npy read with os.pread (no mapping, no readahead); `frames[rows]` like the memmap."""
+
+    def __init__(self, path, header):
+        self.shape, self.dtype = header.shape, header.dtype
+        self.offset = header.offset
+        self.row_bytes = int(np.prod(self.shape[1:])) * self.dtype.itemsize
+        self.fd = os.open(path, os.O_RDONLY)
+        if hasattr(os, 'posix_fadvise'):
+            os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
+
+    def __getitem__(self, rows):
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        out = np.empty((len(rows), *self.shape[1:]), self.dtype)
+        view = memoryview(out.reshape(len(rows), -1)).cast('B')
+        for i, row in enumerate(rows.tolist()):
+            if not 0 <= row < self.shape[0]:
+                raise IndexError(f'frame {row} out of range {self.shape[0]}')
+            start = i * self.row_bytes
+            got = os.preadv(self.fd, [view[start:start + self.row_bytes]], self.offset + row * self.row_bytes)
+            if got != self.row_bytes:
+                raise OSError(f'short read of frame {row}: {got} of {self.row_bytes} bytes')
+        return out
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class FrameCacheReader:
     """Drop-in for VideoReader.read over a built cache (lazily memory-mapped per process).
 
@@ -168,6 +213,9 @@ class FrameCacheReader:
         return dict(self.__dict__, entries=OrderedDict(), entry_formats=OrderedDict(), _v2=None)
 
     def close(self):
+        for frames, _ in self.entries.values():
+            if isinstance(frames, _PreadFrames):
+                frames.close()
         self.entries.clear()
         if self._v2 is not None:
             self._v2.close()
@@ -202,13 +250,17 @@ class FrameCacheReader:
             if frames.shape != (manifest['frames'], self.image_size, self.image_size, 3) or frames.dtype != np.uint8 \
                     or pts.shape != (manifest['frames'],):
                 raise ValueError(f'Corrupt frame cache entry {stem}; rebuild it')
+            if FRAME_READ == 'pread':
+                frames = _PreadFrames(frames_path, frames)  # the memmap was only the validated header
             entry = self.entries[path] = (frames, pts)
             self.entry_formats[path] = manifest['format']
             self.seen_formats.add(manifest['format'])
             while len(self.entry_formats) > 16:
                 self.entry_formats.popitem(last=False)
             while len(self.entries) > 16:
-                self.entries.popitem(last=False)
+                old, _ = self.entries.popitem(last=False)[1]
+                if isinstance(old, _PreadFrames):
+                    old.close()
         self.entries.move_to_end(path)
         return entry
 
