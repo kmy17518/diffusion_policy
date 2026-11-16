@@ -91,7 +91,7 @@ upload() {
 
 train() {
     [[ -f $STATS ]] || { echo "no prepared statistics $STATS: run '$0 prepare' first" >&2; exit 1; }
-    mkdir -p "$OUT"
+    mkdir -p "$OUT" "$OUT_ROOT/upload"   # the uploader log below is opened before upload() runs its mkdir
     local resume=()
     [[ ! -e $OUT/latest.pt ]] || resume=(--resume "$OUT/latest.pt")
     rm -f "$OUT_ROOT/$RUN.stop"
